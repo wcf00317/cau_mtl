@@ -13,8 +13,8 @@ data:
 model:
   encoder_name: "vit_b_16"
   pretrained: True
-  latent_dim_s: 64
-  latent_dim_p: 128
+  latent_dim_s: 128
+  latent_dim_p: 256
   z_s_bottleneck_noise: 0.1
   num_scene_classes: 27 # NYUv2有27个场景类别
 

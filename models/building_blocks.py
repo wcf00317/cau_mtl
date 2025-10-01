@@ -112,36 +112,38 @@ class SimpleDecoder(nn.Module):
 
 class ConvDecoder(nn.Module):
     """
-    A simple Convolutional Decoder to reconstruct maps from a non-spatial latent vector.
-    This is specifically used for the visualization part of the pre-experiment.
+    一个增强版的卷积解码器，使用InstanceNorm2d来保证在小批次下的训练稳定性。
     """
-
     def __init__(self, latent_dim, output_channels, target_size=(224, 224)):
         super().__init__()
         self.target_size = target_size
-        self.latent_dim = latent_dim
-        self.output_channels = output_channels
-
-        # This starting grid size should align with the ViT patch grid (e.g., 14x14)
         start_size = target_size[0] // 16
+
         self.upsample_in = nn.Sequential(
-            nn.Linear(latent_dim, 256 * start_size * start_size),
+            nn.Linear(latent_dim, 512 * start_size * start_size),
             nn.ReLU(True)
         )
         self.start_size = start_size
 
         self.net = nn.Sequential(
-            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1),  # 14x14 -> 28x28
+            # 14x14 -> 28x28
+            nn.ConvTranspose2d(512, 256, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(256), # <-- 使用 InstanceNorm2d 替换 BatchNorm2d
             nn.ReLU(True),
-            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1),  # -> 56x56
+            # 28x28 -> 56x56
+            nn.ConvTranspose2d(256, 128, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(128), # <-- 使用 InstanceNorm2d 替换 BatchNorm2d
             nn.ReLU(True),
-            nn.ConvTranspose2d(64, 32, kernel_size=4, stride=2, padding=1),  # -> 112x112
+            # 56x56 -> 112x112
+            nn.ConvTranspose2d(128, 64, kernel_size=4, stride=2, padding=1, bias=False),
+            nn.InstanceNorm2d(64),  # <-- 使用 InstanceNorm2d 替换 BatchNorm2d
             nn.ReLU(True),
-            nn.ConvTranspose2d(32, output_channels, kernel_size=4, stride=2, padding=1)  # -> 224x224
+            # 112x112 -> 224x224 (最后一层不加归一化和ReLU)
+            nn.ConvTranspose2d(64, output_channels, kernel_size=4, stride=2, padding=1)
         )
 
     def forward(self, x):
         x = self.upsample_in(x)
-        x = x.view(-1, 256, self.start_size, self.start_size)  # Reshape to (B, 256, 14, 14)
+        x = x.view(-1, 512, self.start_size, self.start_size)
         x = self.net(x)
         return x

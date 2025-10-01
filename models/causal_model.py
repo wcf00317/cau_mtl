@@ -33,6 +33,7 @@ class SegDepthDecoder(nn.Module):
         x = self.upsample4(x)
         return self.final_conv(x)
 
+
 class CausalMTLModel(nn.Module):
     def __init__(self, model_config, data_config):
         super().__init__()
