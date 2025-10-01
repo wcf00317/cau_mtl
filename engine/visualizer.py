@@ -86,6 +86,7 @@ def _visualize_microscope(model, batch, device, save_path, scene_class_map):
     axes[3].imshow(recon_app_rgb);
     axes[3].set_title("Model's Understanding:\nAppearance from $z_{p,seg}$", fontsize=16)
     for ax in axes.flat: ax.axis('off')
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
 
@@ -93,26 +94,26 @@ def _visualize_microscope(model, batch, device, save_path, scene_class_map):
 def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map):
     rgb_a = batch_a['rgb'][0].unsqueeze(0).to(device);
     out_a = model(rgb_a);
-    z_s_a, z_p_a = out_a['z_s'], out_a['z_p_seg'];
+    z_s_a_map, z_p_a_map = out_a['z_s_map'], out_a['z_p_seg_map']
     gt_scene_a = scene_class_map[batch_a['scene_type'][0].item()]
     rgb_b = batch_b['rgb'][0].unsqueeze(0).to(device);
     out_b = model(rgb_b);
-    z_s_b, z_p_b = out_b['z_s'], out_b['z_p_seg'];
+    z_s_b_map, z_p_b_map = out_b['z_s_map'], out_b['z_p_seg_map'];
     gt_scene_b = scene_class_map[batch_b['scene_type'][0].item()]
     img_size = tuple(rgb_a.shape[2:])
 
-    def create_hybrid(z_s, z_p):
-        # --- 核心修复 2: 调用解码器后，只取第一个返回值 ---
-        geom_final, _ = model.decoder_geom(z_s)
-        app_final, _ = model.decoder_app(z_p)
+    def create_hybrid(z_s_map, z_p_map):
+        # --- 调用解码器时，传入正确的 _map 变量 ---
+        geom_final, _ = model.decoder_geom(z_s_map)
+        app_final, _ = model.decoder_app(z_p_map)
         geom = geom_final.squeeze()
         app = lab_channels_to_rgb(app_final.squeeze(), img_size)
         return fuse_geom_and_app(geom, app)
 
-    hybrid_A_A = create_hybrid(z_s_a, z_p_a);
-    hybrid_A_B = create_hybrid(z_s_a, z_p_b);
-    hybrid_B_A = create_hybrid(z_s_b, z_p_a);
-    hybrid_B_B = create_hybrid(z_s_b, z_p_b)
+    hybrid_A_A = create_hybrid(z_s_a_map, z_p_a_map);
+    hybrid_A_B = create_hybrid(z_s_a_map, z_p_b_map);
+    hybrid_B_A = create_hybrid(z_s_b_map, z_p_a_map);
+    hybrid_B_B = create_hybrid(z_s_b_map, z_p_b_map)
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), gridspec_kw={'wspace': 0.05, 'hspace': 0.25})
     # ... (绘图的其余部分保持不变) ...
     fig.suptitle("Visualization Report 2: The Causal Mixer", fontsize=22, y=0.97)
@@ -124,18 +125,8 @@ def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map
     axes[1, 0].set_title(f"Hybrid: Geom B + App A", fontsize=14)
     axes[1, 1].imshow(hybrid_B_B);
     axes[1, 1].set_title(f"Reconstructed Scene B\n(GT Scene: '{gt_scene_b}')", fontsize=14)
-    pad = 5
-    axes[0, 0].annotate('Geometry from A', xy=(0, 0.5), xytext=(-axes[0, 0].yaxis.labelpad - pad, 0),
-                        xycoords=axes[0, 0].yaxis.label, textcoords='offset points', size='large', ha='right',
-                        va='center', rotation=90)
-    axes[1, 0].annotate('Geometry from B', xy=(0, 0.5), xytext=(-axes[1, 0].yaxis.labelpad - pad, 0),
-                        xycoords=axes[1, 0].yaxis.label, textcoords='offset points', size='large', ha='right',
-                        va='center', rotation=90)
-    axes[0, 0].annotate('Appearance from A', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction',
-                        textcoords='offset points', size='large', ha='center', va='baseline')
-    axes[0, 1].annotate('Appearance from B', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction',
-                        textcoords='offset points', size='large', ha='center', va='baseline')
     for ax in axes.flat: ax.set_xticks([]); ax.set_yticks([])
+    plt.tight_layout(rect=[0, 0, 1, 0.96])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
 

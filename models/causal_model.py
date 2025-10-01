@@ -113,8 +113,8 @@ class CausalMTLModel(nn.Module):
         # 6. 用于可视化的解码器使用全局向量
         # recon_geom = self.decoder_geom(z_s)
         # recon_app = self.decoder_app(z_p_seg)
-        recon_geom_final, recon_geom_aux = self.decoder_geom(z_s)
-        recon_app_final, recon_app_aux = self.decoder_app(z_p_seg)
+        recon_geom_final, recon_geom_aux = self.decoder_geom(z_s_map)
+        recon_app_final, recon_app_aux = self.decoder_app(z_p_seg_map)
 
         outputs = {
             'z_s': z_s,
@@ -129,7 +129,10 @@ class CausalMTLModel(nn.Module):
             'recon_geom': recon_geom_final,      # 主重构
             'recon_app': recon_app_final,  # 主重构
             'recon_geom_aux': recon_geom_aux,  # 辅助重构
-            'recon_app_aux': recon_app_aux  # 辅助重构
+            'recon_app_aux': recon_app_aux,  # 辅助重构
+
+            'z_s_map': z_s_map,
+            'z_p_seg_map': z_p_seg_map
         }
 
         return outputs

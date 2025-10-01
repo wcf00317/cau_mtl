@@ -181,14 +181,15 @@ class ResNetDecoderWithDeepSupervision(nn.Module):
     """
     使用残差块构建的解码器，并集成了深度监督功能。
     """
-    def __init__(self, latent_dim, output_channels, target_size=(224, 224)):
+    def __init__(self, input_channels, output_channels, target_size=(224, 224)):
         super().__init__()
         self.target_size = target_size
         start_size = target_size[0] // 16  # 224 / 16 = 14
 
         # 初始层：将扁平的latent vector转换为14x14的特征图
-        self.upsample_in = nn.Sequential(
-            nn.Linear(latent_dim, 512 * start_size * start_size),
+        self.initial_conv = nn.Sequential(
+            nn.Conv2d(input_channels, 512, kernel_size=3, padding=1, bias=False),
+            nn.InstanceNorm2d(512),
             nn.ReLU(True)
         )
         self.start_size = start_size
@@ -210,8 +211,9 @@ class ResNetDecoderWithDeepSupervision(nn.Module):
 
     def forward(self, x):
         # 1. 初始上采样
-        x = self.upsample_in(x)
-        x = x.view(-1, 512, self.start_size, self.start_size)
+        # x = self.upsample_in(x)
+        # x = x.view(-1, 512, self.start_size, self.start_size)
+        x = self.initial_conv(x)
 
         # 2. 通过残差块
         x = self.res_block1(x)
