@@ -102,7 +102,7 @@ def main(config_path):
         optimizer = optim.Adam(model.parameters(), lr=config['training']['learning_rate'])
 
     scheduler = optim.lr_scheduler.StepLR(optimizer, step_size=30, gamma=0.1)
-    criterion = CompositeLoss(loss_weights=config['losses'])
+    criterion = CompositeLoss(loss_weights=config['losses']).to(device)
     print("⚙️ Model, optimizer, scheduler, and loss function are ready.")
     # --- 必改6: 需确认CompositeLoss的返回接口与trainer兼容 ---
     # 我们已在上一版中统一 CompositeLoss 返回 (total_loss, loss_dict)，

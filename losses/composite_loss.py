@@ -16,7 +16,7 @@ class CompositeLoss(nn.Module):
         self.independence_loss = HSIC(normalize=True)
         self.recon_geom_loss = nn.L1Loss()
         #self.recon_app_loss = nn.MSELoss()
-        self.lpips_loss = LPIPSMetric(net='vgg').to(device)
+        self.recon_app_loss = LPIPSMetric(net='vgg')
 
     def forward(self, outputs, targets):
         loss_dict = {}

@@ -80,7 +80,9 @@ class CausalMTLModel(nn.Module):
         # self.decoder_geom = VisualizationDecoder(self.latent_dim_s, 1, data_config['img_size'])
         # self.decoder_app = VisualizationDecoder(self.latent_dim_p, 2, data_config['img_size'])
         self.decoder_geom = ResNetDecoderWithDeepSupervision(self.latent_dim_s, 1, tuple(data_config['img_size']))
-        self.decoder_app = ResNetDecoderWithDeepSupervision(self.latent_dim_p, 2, tuple(data_config['img_size']))
+        #self.decoder_app = ResNetDecoderWithDeepSupervision(self.latent_dim_p, 2, tuple(data_config['img_size']))
+        self.decoder_app = ResNetDecoderWithDeepSupervision(self.latent_dim_p, 3, tuple(data_config['img_size']))
+        self.final_app_activation = nn.Sigmoid()
 
     def forward(self, x):
         feature_map = self.encoder(x)
@@ -114,7 +116,10 @@ class CausalMTLModel(nn.Module):
         # recon_geom = self.decoder_geom(z_s)
         # recon_app = self.decoder_app(z_p_seg)
         recon_geom_final, recon_geom_aux = self.decoder_geom(z_s_map)
-        recon_app_final, recon_app_aux = self.decoder_app(z_p_seg_map)
+        recon_app_final_logits, recon_app_aux_logits = self.decoder_app(z_p_seg_map)
+
+        recon_app_final = self.final_app_activation(recon_app_final_logits)
+        recon_app_aux = self.final_app_activation(recon_app_aux_logits)
 
         outputs = {
             'z_s': z_s,
