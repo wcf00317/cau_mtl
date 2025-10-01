@@ -55,47 +55,89 @@ def fuse_geom_and_app(geom_map, app_map):
 
 
 def _visualize_microscope(model, batch, device, save_path, scene_class_map):
-    # (函数内部逻辑不变, 只是确认最后保存时用的是 save_path)
-    idx=0; rgb_tensor=batch['rgb'][idx].unsqueeze(0).to(device); outputs=model(rgb_tensor)
-    input_rgb=denormalize_image(batch['rgb'][idx]); gt_depth=batch['depth'][idx].squeeze().cpu().numpy()
-    gt_scene_idx=batch['scene_type'][idx].item(); pred_scene_idx=outputs['pred_scene'].argmax(dim=1)[0].item()
-    gt_scene_name=scene_class_map[gt_scene_idx]; pred_scene_name=scene_class_map[pred_scene_idx]
-    recon_geom_raw=outputs['recon_geom'][0].squeeze().cpu().numpy(); recon_app_rgb=lab_channels_to_rgb(outputs['recon_app'][0],gt_depth.shape[:2])
+    idx = 0
+    rgb_tensor = batch['rgb'][idx].unsqueeze(0).to(device)
+    outputs = model(rgb_tensor)
+
+    # --- 核心修复 1: 只取重构的第一个输出 (final) ---
+    recon_geom_final = outputs['recon_geom']
+    recon_app_final = outputs['recon_app']
+
+    input_rgb = denormalize_image(batch['rgb'][idx])
+    gt_depth = batch['depth'][idx].squeeze().cpu().numpy()
+    gt_scene_idx = batch['scene_type'][idx].item()
+    pred_scene_idx = outputs['pred_scene'].argmax(dim=1)[0].item()
+    gt_scene_name = scene_class_map[gt_scene_idx]
+    pred_scene_name = scene_class_map[pred_scene_idx]
+
+    recon_geom_raw = recon_geom_final[0].squeeze().cpu().numpy()
+    recon_app_rgb = lab_channels_to_rgb(recon_app_final[0], gt_depth.shape[:2])
+
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     title = f"Causal Microscope\nGT Scene: '{gt_scene_name}' | Pred Scene: '{pred_scene_name}' ({'Correct' if gt_scene_idx == pred_scene_idx else 'Wrong'})"
     fig.suptitle(title, fontsize=22)
     vmin, vmax = np.percentile(gt_depth, 2), np.percentile(gt_depth, 98)
-    axes[0].imshow(input_rgb); axes[0].set_title("Input RGB", fontsize=16)
-    axes[1].imshow(gt_depth, cmap='viridis', vmin=vmin, vmax=vmax); axes[1].set_title("Ground Truth: Depth (Geometry)", fontsize=16)
-    axes[2].imshow(recon_geom_raw, cmap='viridis', vmin=vmin, vmax=vmax); axes[2].set_title("Model's Understanding:\nGeometry from $z_s$", fontsize=16)
-    axes[3].imshow(recon_app_rgb); axes[3].set_title("Model's Understanding:\nAppearance from $z_{p,seg}$", fontsize=16)
+    axes[0].imshow(input_rgb);
+    axes[0].set_title("Input RGB", fontsize=16)
+    axes[1].imshow(gt_depth, cmap='viridis', vmin=vmin, vmax=vmax);
+    axes[1].set_title("Ground Truth: Depth (Geometry)", fontsize=16)
+    axes[2].imshow(recon_geom_raw, cmap='viridis', vmin=vmin, vmax=vmax);
+    axes[2].set_title("Model's Understanding:\nGeometry from $z_s$", fontsize=16)
+    axes[3].imshow(recon_app_rgb);
+    axes[3].set_title("Model's Understanding:\nAppearance from $z_{p,seg}$", fontsize=16)
     for ax in axes.flat: ax.axis('off')
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
 
+
 def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map):
-    rgb_a=batch_a['rgb'][0].unsqueeze(0).to(device); out_a=model(rgb_a); z_s_a,z_p_a=out_a['z_s'],out_a['z_p_seg']; gt_scene_a=scene_class_map[batch_a['scene_type'][0].item()]
-    rgb_b=batch_b['rgb'][0].unsqueeze(0).to(device); out_b=model(rgb_b); z_s_b,z_p_b=out_b['z_s'],out_b['z_p_seg']; gt_scene_b=scene_class_map[batch_b['scene_type'][0].item()]
-    img_size=tuple(rgb_a.shape[2:])
+    rgb_a = batch_a['rgb'][0].unsqueeze(0).to(device);
+    out_a = model(rgb_a);
+    z_s_a, z_p_a = out_a['z_s'], out_a['z_p_seg'];
+    gt_scene_a = scene_class_map[batch_a['scene_type'][0].item()]
+    rgb_b = batch_b['rgb'][0].unsqueeze(0).to(device);
+    out_b = model(rgb_b);
+    z_s_b, z_p_b = out_b['z_s'], out_b['z_p_seg'];
+    gt_scene_b = scene_class_map[batch_b['scene_type'][0].item()]
+    img_size = tuple(rgb_a.shape[2:])
+
     def create_hybrid(z_s, z_p):
-        geom = model.decoder_geom(z_s).squeeze(); app = lab_channels_to_rgb(model.decoder_app(z_p).squeeze(), img_size)
+        # --- 核心修复 2: 调用解码器后，只取第一个返回值 ---
+        geom_final, _ = model.decoder_geom(z_s)
+        app_final, _ = model.decoder_app(z_p)
+        geom = geom_final.squeeze()
+        app = lab_channels_to_rgb(app_final.squeeze(), img_size)
         return fuse_geom_and_app(geom, app)
-    hybrid_A_A=create_hybrid(z_s_a,z_p_a); hybrid_A_B=create_hybrid(z_s_a,z_p_b); hybrid_B_A=create_hybrid(z_s_b,z_p_a); hybrid_B_B=create_hybrid(z_s_b,z_p_b)
+
+    hybrid_A_A = create_hybrid(z_s_a, z_p_a);
+    hybrid_A_B = create_hybrid(z_s_a, z_p_b);
+    hybrid_B_A = create_hybrid(z_s_b, z_p_a);
+    hybrid_B_B = create_hybrid(z_s_b, z_p_b)
     fig, axes = plt.subplots(2, 2, figsize=(12, 12), gridspec_kw={'wspace': 0.05, 'hspace': 0.25})
+    # ... (绘图的其余部分保持不变) ...
     fig.suptitle("Visualization Report 2: The Causal Mixer", fontsize=22, y=0.97)
-    axes[0, 0].imshow(hybrid_A_A); axes[0, 0].set_title(f"Reconstructed Scene A\n(GT Scene: '{gt_scene_a}')", fontsize=14)
-    axes[0, 1].imshow(hybrid_A_B); axes[0, 1].set_title(f"Hybrid: Geom A + App B", fontsize=14)
-    axes[1, 0].imshow(hybrid_B_A); axes[1, 0].set_title(f"Hybrid: Geom B + App A", fontsize=14)
-    axes[1, 1].imshow(hybrid_B_B); axes[1, 1].set_title(f"Reconstructed Scene B\n(GT Scene: '{gt_scene_b}')", fontsize=14)
-    pad=5
-    axes[0, 0].annotate('Geometry from A', xy=(0, 0.5), xytext=(-axes[0, 0].yaxis.labelpad-pad, 0), xycoords=axes[0, 0].yaxis.label, textcoords='offset points', size='large', ha='right', va='center', rotation=90)
-    axes[1, 0].annotate('Geometry from B', xy=(0, 0.5), xytext=(-axes[1, 0].yaxis.labelpad-pad, 0), xycoords=axes[1, 0].yaxis.label, textcoords='offset points', size='large', ha='right', va='center', rotation=90)
-    axes[0, 0].annotate('Appearance from A', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction', textcoords='offset points', size='large', ha='center', va='baseline')
-    axes[0, 1].annotate('Appearance from B', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction', textcoords='offset points', size='large', ha='center', va='baseline')
+    axes[0, 0].imshow(hybrid_A_A);
+    axes[0, 0].set_title(f"Reconstructed Scene A\n(GT Scene: '{gt_scene_a}')", fontsize=14)
+    axes[0, 1].imshow(hybrid_A_B);
+    axes[0, 1].set_title(f"Hybrid: Geom A + App B", fontsize=14)
+    axes[1, 0].imshow(hybrid_B_A);
+    axes[1, 0].set_title(f"Hybrid: Geom B + App A", fontsize=14)
+    axes[1, 1].imshow(hybrid_B_B);
+    axes[1, 1].set_title(f"Reconstructed Scene B\n(GT Scene: '{gt_scene_b}')", fontsize=14)
+    pad = 5
+    axes[0, 0].annotate('Geometry from A', xy=(0, 0.5), xytext=(-axes[0, 0].yaxis.labelpad - pad, 0),
+                        xycoords=axes[0, 0].yaxis.label, textcoords='offset points', size='large', ha='right',
+                        va='center', rotation=90)
+    axes[1, 0].annotate('Geometry from B', xy=(0, 0.5), xytext=(-axes[1, 0].yaxis.labelpad - pad, 0),
+                        xycoords=axes[1, 0].yaxis.label, textcoords='offset points', size='large', ha='right',
+                        va='center', rotation=90)
+    axes[0, 0].annotate('Appearance from A', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction',
+                        textcoords='offset points', size='large', ha='center', va='baseline')
+    axes[0, 1].annotate('Appearance from B', xy=(0.5, 1), xytext=(0, pad), xycoords='axes fraction',
+                        textcoords='offset points', size='large', ha='center', va='baseline')
     for ax in axes.flat: ax.set_xticks([]); ax.set_yticks([])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
-
 
 @torch.no_grad()
 def generate_visual_reports(model, data_loader, device, save_dir="visualizations_final", num_reports=3):
