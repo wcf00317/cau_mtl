@@ -21,7 +21,7 @@ model:
 # -- Training Parameters --
 training:
   seed: 42
-  epochs: 30
+  epochs: 100
   optimizer: "AdamW"
   learning_rate: 0.00001
   weight_decay: 0.01
@@ -29,11 +29,12 @@ training:
 
 # -- Loss Weights --
 losses:
-    lambda_seg: 10.0          # 大幅提高
+    lambda_seg: 20.0          # 大幅提高
     lambda_depth: 5.0          # 大幅提高
     lambda_scene: 5.0          # 大幅提高
     lambda_independence: 0.1   # 适当降低
     alpha_recon_geom: 1.0      # 保持或适当降低
-    beta_recon_app: 5.0        # 保持，因为外观重构依然重要
+    beta_recon_app: 3.0 # 这是LPIPS的权重
+    lambda_l1_recon: 3.0
     alpha_recon_geom_aux: 0.5
     beta_recon_app_aux: 2.5
