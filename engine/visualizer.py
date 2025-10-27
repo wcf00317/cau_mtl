@@ -71,8 +71,8 @@ def _visualize_microscope(model, batch, device, save_path, scene_class_map):
     pred_scene_name = scene_class_map[pred_scene_idx]
 
     recon_geom_raw = recon_geom_final[0].squeeze().cpu().numpy()
-    recon_app_rgb = lab_channels_to_rgb(recon_app_final[0], gt_depth.shape[:2])
-
+    #recon_app_rgb = lab_channels_to_rgb(recon_app_final[0], gt_depth.shape[:2])
+    recon_app_rgb = recon_app_final[0].detach().cpu().permute(1, 2, 0).numpy()
     fig, axes = plt.subplots(1, 4, figsize=(24, 6))
     title = f"Causal Microscope\nGT Scene: '{gt_scene_name}' | Pred Scene: '{pred_scene_name}' ({'Correct' if gt_scene_idx == pred_scene_idx else 'Wrong'})"
     fig.suptitle(title, fontsize=22)
@@ -89,7 +89,6 @@ def _visualize_microscope(model, batch, device, save_path, scene_class_map):
     plt.tight_layout(rect=[0, 0.03, 1, 0.93])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
-
 
 def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map):
     rgb_a = batch_a['rgb'][0].unsqueeze(0).to(device);
@@ -130,6 +129,102 @@ def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
 
+
+def _visualize_depth_task(model, batch, device, save_path):
+    """
+    [已更新] 生成一个独立的、专注于深度任务和 z_s / z_p 解耦分析的可视化报告。
+    """
+    model.eval()
+    idx = 0  # 仅可视化批次中的第一张图
+
+    rgb_tensor = batch['rgb'][idx].unsqueeze(0).to(device)
+
+    # --- 1. 准备绘图所需的基础数据 ---
+    input_rgb = denormalize_image(batch['rgb'][idx])
+    gt_depth = batch['depth'][idx].squeeze().cpu().numpy()
+
+    # --- 2. 手动执行模型的关键步骤以进行解耦分析 ---
+    #    (这比依赖 model.forward() 输出更鲁棒)
+
+    # a. 获取 ViT 特征
+    feature_map = model.encoder(rgb_tensor)  # [B, 768, 14, 14]
+
+    # b. 获取投影后的特征图 (f, z_s, z_p)
+    f_proj = model.proj_f(feature_map)  # [B, 256, 14, 14]
+    zs_map = model.projector_s(feature_map)
+    zs_proj = model.proj_z_s(zs_map)  # [B, 256, 14, 14]
+    zp_depth_map = model.projector_p_depth(feature_map)
+    zp_depth_proj = model.proj_z_p_depth(zp_depth_map)  # [B, 256, 14, 14]
+
+    # c. 创建用于 "crosstalk" 分析的零张量
+    zeros_f = torch.zeros_like(f_proj)
+    zeros_zs = torch.zeros_like(zs_proj)
+    zeros_zp = torch.zeros_like(zp_depth_proj)
+
+    with torch.no_grad():
+        # 完整的预测 (f + z_s + z_p)
+        pred_main_tensor = model.predictor_depth(torch.cat([f_proj, zs_proj, zp_depth_proj], dim=1))
+
+        # 仅 Z_s 贡献 (0 + z_s + 0)
+        pred_zs_only_tensor = model.predictor_depth(torch.cat([zeros_f, zs_proj, zeros_zp], dim=1))
+
+        # 仅 Z_p 贡献 (0 + 0 + z_p)
+        pred_zp_only_tensor = model.predictor_depth(torch.cat([zeros_f, zeros_zs, zp_depth_proj], dim=1))
+
+    # d. 将 Tensors 转换为 Numpy 数组
+    pred_depth_main = pred_main_tensor[0].squeeze().cpu().numpy()
+    pred_depth_zs = pred_zs_only_tensor[0].squeeze().cpu().numpy()  # <-- 新增
+    pred_depth_zp = pred_zp_only_tensor[0].squeeze().cpu().numpy()  # <-- 重新计算
+
+    # e. 计算预测误差图
+    error_map = np.abs(pred_depth_main - gt_depth)
+
+    # --- 3. 开始绘图 (1x6 布局) ---
+    fig, axes = plt.subplots(1, 6, figsize=(36, 6))  # <-- 扩展到 6 张图
+    fig.suptitle("Depth Task & Full Decoupling Analysis ($z_s$ vs $z_p$)", fontsize=22)
+
+    # 使用百分位数来稳健地统一所有深度图的颜色范围
+    vmin, vmax = np.percentile(gt_depth, [2, 98])
+
+    # 图 1: 输入 RGB
+    axes[0].imshow(input_rgb)
+    axes[0].set_title("Input RGB", fontsize=16)
+
+    # 图 2: 真实深度
+    axes[1].imshow(gt_depth, cmap='plasma', vmin=vmin, vmax=vmax)
+    axes[1].set_title("Ground Truth Depth", fontsize=16)
+
+    # 图 3: 主路预测深度 (f + z_s + z_p)
+    axes[2].imshow(pred_depth_main, cmap='plasma', vmin=vmin, vmax=vmax)
+    axes[2].set_title("Main Predicted Depth\n(from f + $z_s$ + $z_p$)", fontsize=16)
+
+    # --- 图 4: [新增] 从 z_s 解码的深度 ---
+    im_zs = axes[3].imshow(pred_depth_zs, cmap='plasma', vmin=vmin, vmax=vmax)
+    axes[3].set_title("Depth from $z_s$ only\n(Shared Geometry)", fontsize=16)
+
+    # --- 图 5: [原图4] 从 z_p_depth 解码的深度 ---
+    im_zp = axes[4].imshow(pred_depth_zp, cmap='plasma', vmin=vmin, vmax=vmax)
+    axes[4].set_title("Depth from $z_{p,depth}$ only\n(Private Specifics)", fontsize=16)
+
+    # --- 图 6: [原图5] 预测误差 ---
+    im_err = axes[5].imshow(error_map, cmap='hot')
+    axes[5].set_title("Prediction Error", fontsize=16)
+
+    # 美化图像
+    for ax in axes.flat:
+        ax.axis('off')
+
+    # 调整色条
+    fig.colorbar(im_zs, ax=axes[3], fraction=0.046, pad=0.04)  # <-- 新增色条
+    fig.colorbar(im_zp, ax=axes[4], fraction=0.046, pad=0.04)  # <-- 调整到 axes[4]
+    fig.colorbar(im_err, ax=axes[5], fraction=0.046, pad=0.04)  # <-- 调整到 axes[5]
+
+    plt.tight_layout(rect=[0, 0.03, 1, 0.93])
+    plt.savefig(save_path, bbox_inches='tight', dpi=150)
+    plt.close(fig)
+    print(f"  -> 已保存 *完整* 深度分析可视化报告: {save_path}")
+
+
 @torch.no_grad()
 def generate_visual_reports(model, data_loader, device, save_dir="visualizations_final", num_reports=3):
     """
@@ -158,11 +253,18 @@ def generate_visual_reports(model, data_loader, device, save_dir="visualizations
 
         print(f"--- Generating Report Set {i + 1}/{num_reports} ---")
 
-        # 为每个报告生成唯一的文件名
+        # 原有的可视化文件路径
         microscope_path = os.path.join(save_dir, f"report_1_microscope_{i + 1}.png")
         mixer_path = os.path.join(save_dir, f"report_2_mixer_{i + 1}.png")
 
+        # 为新的深度分析报告定义文件路径
+        depth_analysis_path = os.path.join(save_dir, f"report_3_depth_analysis_{i + 1}.png")
+
         _visualize_microscope(model, sample_a, device, microscope_path, scene_class_map)
         _visualize_mixer(model, sample_a, sample_b, device, mixer_path, scene_class_map)
+
+        # 增加对新函数的调用，使用 sample_a 进行分析
+        _visualize_depth_task(model, sample_a, device, depth_analysis_path)
+
 
     print(f"✅ Final visualization reports saved to '{save_dir}'.")

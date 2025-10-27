@@ -11,15 +11,16 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
     total_train_loss = 0.0
     pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Training]", leave=False)
     #_has_printed_grad_debug = False
+
     for batch in pbar:
-        rgb = batch['rgb'].to(device)
-        targets_on_device = {k: (v.to(device) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
+        rgb = batch['rgb']
 
         optimizer.zero_grad()
         outputs = model(rgb)
 
         # Support criterion that returns either dict or (total_loss, dict)
-        crit_out = criterion(outputs, targets_on_device)
+        crit_out = criterion(outputs, batch)
         if isinstance(crit_out, tuple) or isinstance(crit_out, list):
             total_loss, loss_dict = crit_out[0], crit_out[1]
         elif isinstance(crit_out, dict):

@@ -92,7 +92,6 @@ def main(config_path):
         model_config=config['model'],
         data_config=config['data']
     ).to(device)
-
     if config['training']['optimizer'] == 'AdamW':
         optimizer = optim.AdamW(
             model.parameters(), lr=config['training']['learning_rate'],
@@ -130,7 +129,7 @@ def main(config_path):
         model.eval()
         vis_loader = DataLoader(val_dataset, batch_size=2, shuffle=True)
         # --- 修改: 将新创建的 vis_dir 传递给可视化函数 ---
-        generate_visual_reports(model, vis_loader, device, save_dir=vis_dir,num_reports=10)
+        generate_visual_reports(model, vis_loader, device, save_dir=vis_dir,num_reports=3)
     else:
         print(f"⚠️ Could not find best model checkpoint at '{best_checkpoint_path}'. Skipping final analysis.")
     # --- 必改3: 安全地调用close方法 ---

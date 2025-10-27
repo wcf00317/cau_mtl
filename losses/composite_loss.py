@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from .hsic import HSIC
+#from .hsic import HSIC
+from .linear_cka import LinearCKA
 import torch.nn.functional as F
 from metrics.lpips import LPIPSMetric
 
@@ -13,7 +14,8 @@ class CompositeLoss(nn.Module):
         self.depth_loss = nn.L1Loss()
         self.scene_loss = nn.CrossEntropyLoss()
 
-        self.independence_loss = HSIC(normalize=True)
+        #self.independence_loss = HSIC(normalize=True)
+        self.independence_loss = LinearCKA(eps=1e-6)
         self.recon_geom_loss = nn.L1Loss()
         #self.recon_app_loss = nn.MSELoss()
         self.recon_app_loss_lpips = LPIPSMetric(net='vgg')  # LPIPS部分
@@ -40,6 +42,10 @@ class CompositeLoss(nn.Module):
         z_p_scene = outputs['z_p_scene']
 
         z_s_centered = z_s - z_s.mean(dim=0, keepdim=True)
+
+        loss_dict['cka_seg'] = self.independence_loss(z_s_centered, z_p_seg - z_p_seg.mean(0, keepdim=True))
+        loss_dict['cka_depth'] = self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True))
+        loss_dict['cka_scene'] = self.independence_loss(z_s_centered, z_p_scene - z_p_scene.mean(0, keepdim=True))
 
         l_ind = (self.independence_loss(z_s_centered, z_p_seg - z_p_seg.mean(0, keepdim=True)) +
                  self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True)) +
@@ -77,12 +83,15 @@ class CompositeLoss(nn.Module):
 
         loss_dict.update({'recon_geom_aux_loss': l_recon_g_aux, 'recon_app_aux_loss': l_recon_a_aux})
 
+        l_depth_from_zp = self.depth_loss(outputs['pred_depth_from_zp'], targets['depth'])
+        loss_dict['depth_from_zp_loss'] = l_depth_from_zp
         # --- 4. Total Loss ---
         total_loss = (l_task +
                       self.weights.get('lambda_independence', 0) * l_ind +
                       self.weights.get('alpha_recon_geom', 0) * l_recon_g +
                       self.weights.get('beta_recon_app', 0) * l_recon_a +
                       self.weights.get('alpha_recon_geom_aux', 0) * l_recon_g_aux +
-                      self.weights.get('beta_recon_app_aux', 0) * l_recon_a_aux)
+                      self.weights.get('beta_recon_app_aux', 0) * l_recon_a_aux+
+                      self.weights.get('lambda_depth_zp', 0) * l_depth_from_zp)
         loss_dict['total_loss'] = total_loss
         return total_loss, loss_dict

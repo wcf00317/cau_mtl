@@ -75,6 +75,7 @@ class CausalMTLModel(nn.Module):
         # 场景分类预测器保持不变
         predictor_scene_input_dim = encoder_feature_dim + self.latent_dim_s + self.latent_dim_p
         self.predictor_scene = MLP(predictor_scene_input_dim, num_scene_classes)
+        self.decoder_zp_depth = SegDepthDecoder(self.latent_dim_p, 1)
 
         from .building_blocks import ConvDecoder as VisualizationDecoder
         # self.decoder_geom = VisualizationDecoder(self.latent_dim_s, 1, data_config['img_size'])
@@ -112,6 +113,8 @@ class CausalMTLModel(nn.Module):
         scene_predictor_input = torch.cat([h, z_s, z_p_scene], dim=1)
         pred_scene = self.predictor_scene(scene_predictor_input)
 
+        pred_depth_from_zp = self.decoder_zp_depth(z_p_depth_map)
+
         # 6. 用于可视化的解码器使用全局向量
         # recon_geom = self.decoder_geom(z_s)
         # recon_app = self.decoder_app(z_p_seg)
@@ -129,6 +132,7 @@ class CausalMTLModel(nn.Module):
             'pred_seg': pred_seg,
             'pred_depth': pred_depth,
             'pred_scene': pred_scene,  # 新增
+            'pred_depth_from_zp': pred_depth_from_zp,
             # 'recon_geom': recon_geom,
             # 'recon_app': recon_app,
             'recon_geom': recon_geom_final,      # 主重构
