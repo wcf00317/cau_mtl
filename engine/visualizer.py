@@ -156,20 +156,23 @@ def _visualize_depth_task(model, batch, device, save_path):
     zp_depth_map = model.projector_p_depth(feature_map)
     zp_depth_proj = model.proj_z_p_depth(zp_depth_map)  # [B, 256, 14, 14]
 
-    # c. 创建用于 "crosstalk" 分析的零张量
-    zeros_f = torch.zeros_like(f_proj)
-    zeros_zs = torch.zeros_like(zs_proj)
+    # ====== 关键修改：适配门控解码器的两参接口 ======
+    # 主路径(main)只用 f_proj + zs_proj；z_p 作为第二个输入传入
+    depth_main = torch.cat([f_proj, zs_proj], dim=1)
+    zeros_main = torch.zeros_like(depth_main)
     zeros_zp = torch.zeros_like(zp_depth_proj)
+    # ===============================================
 
     with torch.no_grad():
-        # 完整的预测 (f + z_s + z_p)
-        pred_main_tensor = model.predictor_depth(torch.cat([f_proj, zs_proj, zp_depth_proj], dim=1))
+        # 完整的预测 (f + z_s + z_p)  ——> (main, zp)
+        pred_main_tensor = model.predictor_depth(depth_main, zp_depth_proj)
 
-        # 仅 Z_s 贡献 (0 + z_s + 0)
-        pred_zs_only_tensor = model.predictor_depth(torch.cat([zeros_f, zs_proj, zeros_zp], dim=1))
+        # 仅 Z_s 贡献： (main, 0)
+        pred_zs_only_tensor = model.predictor_depth(depth_main, zeros_zp)
 
-        # 仅 Z_p 贡献 (0 + 0 + z_p)
-        pred_zp_only_tensor = model.predictor_depth(torch.cat([zeros_f, zeros_zs, zp_depth_proj], dim=1))
+        # 仅 Z_p 贡献： (0, zp)
+        #pred_zp_only_tensor = model.predictor_depth(zeros_main, zp_depth_proj)
+        pred_zp_only_tensor = model.decoder_zp_depth(zp_depth_map)
 
     # d. 将 Tensors 转换为 Numpy 数组
     pred_depth_main = pred_main_tensor[0].squeeze().cpu().numpy()

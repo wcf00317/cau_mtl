@@ -1,7 +1,7 @@
 # 文件: engine/evaluator.py
 # 版本：【已升级，增加可视化指标监控】
 
-import torch
+import torch,logging
 import torchmetrics
 from tqdm import tqdm
 
@@ -86,20 +86,20 @@ def evaluate(model, val_loader, criterion, device):
     final_mae = depth_mae_metric.compute().item()
 
     # --- 7. 【核心修改】: 打印一个更全面的报告 ---
-    print("\n--- Validation Results ---")
-    print(f"Average Total Loss: {avg_val_loss:.4f}")
-    print("\n-- Causal & Reconstruction Losses --")
-    print(f"  - Independence Loss (Linear CKA): {avg_independence_loss:.4f}")
-    print(f"  - CKA (z_s vs z_p_seg):   {avg_cka_seg:.6f} (越低越好)")
-    print(f"  - CKA (z_s vs z_p_depth): {avg_cka_depth:.6f} (越低越好)")
-    print(f"  - CKA (z_s vs z_p_scene): {avg_cka_scene:.6f} (越低越好)")
-    print(f"  - Geometry Recon Loss: {avg_recon_geom_loss:.4f}  <-- 几何清晰度指标")
-    print(f"  - Appearance Recon Loss: {avg_recon_app_loss:.4f}  <-- 外观清晰度指标")
-    print("\n-- Downstream Task Metrics --")
-    print(f"  - Segmentation (mIoU): {final_miou:.4f}")
-    print(f"  - Depth (RMSE): {final_rmse:.4f}")
-    print(f"  - Scene Classification (Acc): {final_scene_acc:.4f}")
-    print("--------------------------")
+    logging.info("\n--- Validation Results ---")
+    logging.info(f"Average Total Loss: {avg_val_loss:.4f}")
+    logging.info("\n-- Causal & Reconstruction Losses --")
+    logging.info(f"  - Independence Loss (Linear CKA): {avg_independence_loss:.4f}")
+    logging.info(f"  - CKA (z_s vs z_p_seg):   {avg_cka_seg:.6f} (越低越好)")
+    logging.info(f"  - CKA (z_s vs z_p_depth): {avg_cka_depth:.6f} (越低越好)")
+    logging.info(f"  - CKA (z_s vs z_p_scene): {avg_cka_scene:.6f} (越低越好)")
+    logging.info(f"  - Geometry Recon Loss: {avg_recon_geom_loss:.4f}  <-- 几何清晰度指标")
+    logging.info(f"  - Appearance Recon Loss: {avg_recon_app_loss:.4f}  <-- 外观清晰度指标")
+    logging.info("\n-- Downstream Task Metrics --")
+    logging.info(f"  - Segmentation (mIoU): {final_miou:.4f}")
+    logging.info(f"  - Depth (RMSE): {final_rmse:.4f}")
+    logging.info(f"  - Scene Classification (Acc): {final_scene_acc:.4f}")
+    logging.info("--------------------------")
     # ---------------------------------------------
 
     miou_metric.reset()

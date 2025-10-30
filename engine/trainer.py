@@ -1,7 +1,7 @@
 import torch
 from torch.optim.lr_scheduler import StepLR
 from tqdm import tqdm
-import os
+import os,logging
 from .evaluator import evaluate
 from utils.general_utils import save_checkpoint
 
@@ -10,7 +10,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
     model.train()
     total_train_loss = 0.0
     pbar = tqdm(train_loader, desc=f"Epoch {epoch + 1} [Training]", leave=False)
-    #_has_printed_grad_debug = False
+    #_has_logging.infoed_grad_debug = False
 
     for batch in pbar:
         batch = {k: (v.to(device, non_blocking=True) if torch.is_tensor(v) else v) for k, v in batch.items()}
@@ -33,17 +33,17 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
 
         total_loss.backward()
 
-        # if not _has_printed_grad_debug and epoch == 0:
-        #     print("\n--- [ONE-TIME DEBUG] Gradient Check ---")
+        # if not _has_logging.infoed_grad_debug and epoch == 0:
+        #     logging.info("\n--- [ONE-TIME DEBUG] Gradient Check ---")
         #     for name, p in model.named_parameters():
         #         # 我们只关心和分割任务直接相关的部分
         #         if 'predictor_seg' in name or 'projector_s' in name or 'projector_p_seg' in name:
         #             is_grad_none = p.grad is None
         #             grad_norm = "N/A" if is_grad_none else p.grad.norm().item()
-        #             print(
+        #             logging.info(
         #                 f"{name:<50} requires_grad={p.requires_grad}, grad_is_None={is_grad_none}, grad_norm={grad_norm}")
-        #     print("--- End of Gradient Check ---\n")
-        #     _has_printed_grad_debug = True
+        #     logging.info("--- End of Gradient Check ---\n")
+        #     _has_logging.infoed_grad_debug = True
 
         optimizer.step()
 
@@ -51,7 +51,7 @@ def train_one_epoch(model, train_loader, optimizer, criterion, device, epoch):
         pbar.set_postfix(loss=f"{total_loss.item():.4f}")
 
     avg_train_loss = total_train_loss / len(train_loader)
-    print(f"Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}")
+    logging.info(f"Epoch {epoch + 1} - Average Training Loss: {avg_train_loss:.4f}")
     return avg_train_loss
 
 
@@ -59,7 +59,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
     best_val_metric = float('inf')
 
     for epoch in range(config['training']['epochs']):
-        print(f"\n----- Starting Epoch {epoch + 1}/{config['training']['epochs']} -----")
+        logging.info(f"\n----- Starting Epoch {epoch + 1}/{config['training']['epochs']} -----")
 
         train_loss = train_one_epoch(model, train_loader, optimizer, criterion, device, epoch)
         val_metrics = evaluate(model, val_loader, criterion, device)
@@ -73,7 +73,7 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
         is_best = val_metrics['depth_rmse'] < best_val_metric
         if is_best:
             best_val_metric = val_metrics['depth_rmse']
-            print(f"  -> New best model found with Depth RMSE: {best_val_metric:.4f}")
+            logging.info(f"  -> New best model found with Depth RMSE: {best_val_metric:.4f}")
 
         save_checkpoint({
             'epoch': epoch + 1,
@@ -82,5 +82,5 @@ def train(model, train_loader, val_loader, optimizer, criterion, scheduler, conf
             'best_val_metric': best_val_metric,
         }, is_best, checkpoint_dir=checkpoint_dir)
 
-    print("\n----- Training Finished -----")
-    print(f"Best model saved with Depth RMSE: {best_val_metric:.4f}")
+    logging.info("\n----- Training Finished -----")
+    logging.info(f"Best model saved with Depth RMSE: {best_val_metric:.4f}")

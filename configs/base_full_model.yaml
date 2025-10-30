@@ -1,44 +1,4 @@
-# -----------------------------------------------
-# Config for Causal Disentanglement Pre-experiment on NYUv2
-# -----------------------------------------------
 
-# -- Data Parameters --
-data:
-  dataset_path: "/data/chengfengwu/alrl/mtl_dataset/nyu_depth_v2_labeled.mat"
-  batch_size: 32
-  num_workers: 16
-  img_size: [224, 224]
-
-# -- Model Parameters --
-model:
-  encoder_name: "vit_b_16"
-  pretrained: True
-  latent_dim_s: 128
-  latent_dim_p: 256
-  z_s_bottleneck_noise: 0.1
-  num_scene_classes: 27 # NYUv2有27个场景类别
-
-# -- Training Parameters --
-training:
-  seed: 42
-  epochs: 30
-  optimizer: "AdamW"
-  learning_rate: 0.00001
-  weight_decay: 0.01
-  enable_training: True
-
-# -- Loss Weights --
-losses:
-    lambda_seg: 10.0          # 大幅提高
-    lambda_depth: 5.0          # 大幅提高
-    lambda_scene: 5.0          # 大幅提高
-    lambda_independence: 0.1   # 适当降低
-    alpha_recon_geom: 1.0      # 保持或适当降低
-    beta_recon_app: 3.0 # 这是LPIPS的权重
-    lambda_l1_recon: 3.0
-    alpha_recon_geom_aux: 0.5
-    beta_recon_app_aux: 2.5
-    lambda_depth_zp: 1.0
 # -----------------------------------------------
 # Config for Causal Disentanglement Pre-experiment on NYUv2
 # -----------------------------------------------
@@ -58,6 +18,7 @@ model:
   latent_dim_p: 256
   z_s_bottleneck_noise: 0.1
   num_scene_classes: 27 # NYUv2有27个场景类别
+  gating_scale_cap: 1.0
 
 # -- Training Parameters --
 training:
@@ -80,3 +41,6 @@ losses:
     alpha_recon_geom_aux: 0.5
     beta_recon_app_aux: 2.5
     lambda_depth_zp: 1.0
+    lambda_edge_consistency: 0.1
+    alpha_recon_geom_edges: 0.1
+    beta_seg_edge_from_geom: 0.1

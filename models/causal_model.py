@@ -1,6 +1,98 @@
 import torch
 import torch.nn as nn
 from .building_blocks import ViTEncoder, MLP, ResNetDecoderWithDeepSupervision
+import torch.nn.functional as F
+
+class GatedFiLM(nn.Module):
+    """用 z_p 对主特征做通道级缩放/平移；scale_cap 限制 z_p 的影响力。"""
+    def __init__(self, c_main: int, c_zp: int, scale_cap: float = 1.0):
+        super().__init__()
+        self.scale_cap = scale_cap
+        self.film = nn.Sequential(
+            nn.AdaptiveAvgPool2d(1),              # [B,c_zp,H,W] -> [B,c_zp,1,1]
+            nn.Conv2d(c_zp, c_main*2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(c_main*2, c_main*2, 1),
+        )
+
+    def forward(self, h_main, z_p):
+        gamma_beta = self.film(z_p)               # [B,2*c_main,1,1]
+        gamma, beta = gamma_beta.chunk(2, dim=1)  # 各 [B,c_main,1,1]
+        gamma = torch.tanh(gamma) * self.scale_cap
+        beta  = torch.tanh(beta)  * self.scale_cap
+        return h_main * (1 + gamma) + beta
+class ZpSegRefiner(nn.Module):
+    """
+    用 z_p_seg 生成一个很小的分割残差（每类一个通道），加到主分割 logits 上。
+    alpha 建议 0.2 左右，避免 z_p 抢权。
+    """
+    def __init__(self, c_in=256, out_classes=40, alpha=0.2):
+        super().__init__()
+        self.alpha = alpha
+        self.net = nn.Sequential(
+            nn.Conv2d(c_in, 128, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(128, 64,  3, padding=1), nn.ReLU(True),
+            nn.Conv2d(64,  out_classes, 3, padding=1)
+        )
+
+    def forward(self, zp_proj, out_size=None):
+        x = self.net(zp_proj)                 # [B,out_classes,14,14]
+        if out_size is not None and x.shape[-2:] != out_size:
+            x = F.interpolate(x, size=out_size, mode='bilinear', align_corners=False)
+        return self.alpha * x
+
+
+class ZpDepthRefiner(nn.Module):
+    """
+    用 z_p_depth 的特征生成一个很小的残差（alpha很小），加到主深度上。
+    这样 z_s 主导结构，z_p 负责补细节，不会喧宾夺主。
+    """
+    def __init__(self, c_in=256, alpha=0.2):
+        super().__init__()
+        self.alpha = alpha
+        self.net = nn.Sequential(
+            nn.Conv2d(c_in, 128, 3, padding=1), nn.ReLU(True),
+            nn.Conv2d(128, 64,  3, padding=1), nn.ReLU(True),
+            nn.Conv2d(64,  1,   3, padding=1)
+        )
+    def forward(self, zp_proj):
+        return self.alpha * self.net(zp_proj)
+
+class GatedSegDepthDecoder(nn.Module):
+    """主路径只吃 (f+z_s)，z_p 通过 FiLM 轻量调制。结构沿用你原来的上采样。"""
+    def __init__(self, main_in_channels: int, z_p_channels: int, out_channels: int, scale_cap: float = 1.0):
+        super().__init__()
+
+        # ✅ 兼容 evaluator：旧代码会访问 predictor_seg.output_channels
+        self.output_channels = out_channels
+
+        def _up(in_c, out_c):
+            return nn.Sequential(
+                nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False),
+                nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
+                nn.BatchNorm2d(out_c),
+                nn.ReLU(inplace=True),
+            )
+        self.up1 = _up(main_in_channels, 256)
+        self.up2 = _up(256, 128)
+        self.up3 = _up(128, 64)
+        self.up4 = _up(64, 32)
+
+        self.g1 = GatedFiLM(256, z_p_channels, scale_cap)
+        self.g2 = GatedFiLM(128, z_p_channels, scale_cap)
+        self.g3 = GatedFiLM(64,  z_p_channels, scale_cap)
+        self.g4 = GatedFiLM(32,  z_p_channels, scale_cap)
+
+        self.final_conv = nn.Conv2d(32, out_channels, 3, padding=1)
+        # 可选：保留你原来的名字做别名，双保险
+        self.final = self.final_conv
+
+    def forward(self, main_feat, z_p_feat):
+        x = self.up1(main_feat); x = self.g1(x, z_p_feat)
+        x = self.up2(x);         x = self.g2(x, z_p_feat)
+        x = self.up3(x);         x = self.g3(x, z_p_feat)
+        x = self.up4(x);         x = self.g4(x, z_p_feat)
+        return self.final_conv(x)   # 或 self.final(x)，两者等价
 
 
 class SegDepthDecoder(nn.Module):
@@ -62,15 +154,31 @@ class CausalMTLModel(nn.Module):
         self.proj_z_s = nn.Conv2d(self.latent_dim_s, PROJ_CHANNELS, kernel_size=1)
         self.proj_z_p_seg = nn.Conv2d(self.latent_dim_p, PROJ_CHANNELS, kernel_size=1)
         self.proj_z_p_depth = nn.Conv2d(self.latent_dim_p, PROJ_CHANNELS, kernel_size=1)
+        self.zp_depth_refiner = ZpDepthRefiner(c_in=PROJ_CHANNELS, alpha=0.2)
+
 
         # 解码器的输入通道数现在是投影后拼接的维度
-        decoder_input_dim = PROJ_CHANNELS * 3  # feature_map + z_s + z_p
-
+        #decoder_input_dim = PROJ_CHANNELS * 3  # feature_map + z_s + z_p
+        decoder_main_dim = PROJ_CHANNELS * 2
         num_seg_classes = 40
         num_scene_classes = model_config['num_scene_classes']
 
-        self.predictor_seg = SegDepthDecoder(decoder_input_dim, num_seg_classes)
-        self.predictor_depth = SegDepthDecoder(decoder_input_dim, 1)
+        self.zp_seg_refiner = ZpSegRefiner(c_in=PROJ_CHANNELS, out_classes=num_seg_classes, alpha=0.2)
+
+        # self.predictor_seg = SegDepthDecoder(decoder_input_dim, num_seg_classes)
+        # self.predictor_depth = SegDepthDecoder(decoder_input_dim, 1)
+        self.predictor_seg = GatedSegDepthDecoder(
+            main_in_channels=decoder_main_dim,
+            z_p_channels=PROJ_CHANNELS,
+            out_channels=num_seg_classes,
+            scale_cap=1.0  # 先用1.0，后续看依赖程度再调
+        )
+        self.predictor_depth = GatedSegDepthDecoder(
+            main_in_channels=decoder_main_dim,
+            z_p_channels=PROJ_CHANNELS,
+            out_channels=1,
+            scale_cap=1.0
+        )
 
         # 场景分类预测器保持不变
         predictor_scene_input_dim = encoder_feature_dim + self.latent_dim_s + self.latent_dim_p
@@ -106,8 +214,20 @@ class CausalMTLModel(nn.Module):
         zp_depth_proj = self.proj_z_p_depth(z_p_depth_map)
 
         # 2. 拼接投影后的特征图，送入解码器
-        pred_seg = self.predictor_seg(torch.cat([f_proj, zs_proj, zp_seg_proj], dim=1))
-        pred_depth = self.predictor_depth(torch.cat([f_proj, zs_proj, zp_depth_proj], dim=1))
+        seg_main = torch.cat([f_proj, zs_proj], dim=1)
+        pred_seg_main = self.predictor_seg(seg_main, zp_seg_proj)  # [B,C,224,224]
+        seg_residual = self.zp_seg_refiner(zp_seg_proj, out_size=pred_seg_main.shape[-2:])
+        pred_seg = pred_seg_main + seg_residual
+
+        #pred_depth = self.predictor_depth(depth_main, zp_depth_proj)
+        depth_main = torch.cat([f_proj, zs_proj], dim=1)
+        pred_depth_main = self.predictor_depth(depth_main, zp_depth_proj)  # 主轴：z_s 主导
+        zp_residual = self.zp_depth_refiner(zp_depth_proj)  # [B,1,14,14]
+        zp_residual = F.interpolate(  # ↑-> [B,1,224,224]
+            zp_residual, size=pred_depth_main.shape[-2:], mode='bilinear', align_corners=False
+        )
+
+        pred_depth = pred_depth_main + zp_residual
 
         # 5. 场景分类使用全局向量
         scene_predictor_input = torch.cat([h, z_s, z_p_scene], dim=1)
