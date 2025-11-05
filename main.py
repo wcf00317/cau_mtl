@@ -25,9 +25,7 @@ def main(config_path):
     try:
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
-        logging.info("✅ Configuration loaded successfully.")
         set_seed(config['training']['seed'])
-        logging.info(f"🌱 Random seed set to {config['training']['seed']}")
     except Exception as e:
         logging.info(f"❌ Error loading config file: {e}")
         return
@@ -39,6 +37,9 @@ def main(config_path):
     os.makedirs(checkpoint_dir, exist_ok=True)
     os.makedirs(vis_dir, exist_ok=True)
     setup_logging(run_dir)
+    logging.info("✅ Configuration loaded successfully.")
+    logging.info("🧩 Full configuration:\n" + yaml.dump(config, sort_keys=False, allow_unicode=True))
+    logging.info(f"🌱 Random seed set to {config['training']['seed']}")
     logging.info(f"📂 All outputs for this run will be saved in: {run_dir}")
     # 2. 设置计算设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -114,6 +115,17 @@ def main(config_path):
         train(model, train_loader, val_loader, optimizer, criterion, scheduler, config, device, checkpoint_dir)
     else:
         logging.info("🏃 Training is disabled in the config. Skipping.")
+    from engine.experiments import run_all_experiments
+    exp_cfg = config.get('experiments', {})
+    if exp_cfg.get('enable', False):
+        logging.info("\n===== Running falsification experiments =====")
+        model.eval()
+        _ = run_all_experiments(
+            model, val_loader, device,
+            max_batches_swap=int(exp_cfg.get('max_batches_swap', 8)),
+            max_batches_inv=int(exp_cfg.get('max_batches_inv', 8)),
+            max_batches_cross=int(exp_cfg.get('max_batches_cross', 20)),
+        )
 
     # 7. 最终可视化与分析
     logging.info("\n----- Running Final Visualizations & Analysis -----")
@@ -130,7 +142,7 @@ def main(config_path):
         model.eval()
         vis_loader = DataLoader(val_dataset, batch_size=2, shuffle=True)
         # --- 修改: 将新创建的 vis_dir 传递给可视化函数 ---
-        generate_visual_reports(model, vis_loader, device, save_dir=vis_dir,num_reports=3)
+        generate_visual_reports(model, vis_loader, device, save_dir=vis_dir,num_reports=5)
     else:
         logging.info(f"⚠️ Could not find best model checkpoint at '{best_checkpoint_path}'. Skipping final analysis.")
     # --- 必改3: 安全地调用close方法 ---

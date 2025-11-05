@@ -5,6 +5,33 @@ from .linear_cka import LinearCKA
 import torch.nn.functional as F
 from metrics.lpips import LPIPSMetric
 
+
+def srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
+    a = 0.055
+    return torch.where(x <= 0.04045, x/12.92, ((x + a)/(1 + a))**2.4).clamp(0,1)
+
+def total_variation_l1(x: torch.Tensor) -> torch.Tensor:
+    dh = (x[:,:,1:,:] - x[:,:,:-1,:]).abs().mean()
+    dw = (x[:,:,:,1:] - x[:,:,:,:-1]).abs().mean()
+    return dh + dw
+
+def cross_covariance_abs(A: torch.Tensor, N: torch.Tensor) -> torch.Tensor:
+    """A: Bx3xHxW, N: Bx3xHxW"""
+    B = A.size(0)
+    a = A.view(B, 3, -1); a = a - a.mean(dim=2, keepdim=True)
+    n = N.view(B, 3, -1); n = n - n.mean(dim=2, keepdim=True)
+    cov = torch.bmm(a, n.transpose(1,2)) / (a.size(-1) - 1)  # Bx3x3
+    return cov.abs().mean()
+
+def rgb_to_lab_safe(x: torch.Tensor) -> torch.Tensor:
+    """如果没装 kornia，就回退成直接返回 x（不会报错，只是少了真正的 Lab 约束）"""
+    try:
+        import kornia as K
+        return K.color.rgb_to_lab(x)
+    except Exception:
+        return x
+
+
 def _sobel(x):
     kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=x.dtype, device=x.device).view(1,1,3,3)
     ky = kx.transpose(2,3)
@@ -38,7 +65,10 @@ def seg_edge_consistency_loss(seg_logits, geom_from_zs, weight=0.1, tau=0.1):
     gx_g, gy_g = _norm(gx_g), _norm(gy_g)
 
     edge_mag = (gx_g.abs() + gy_g.abs())
-    mask = (edge_mag > tau).float()  # 只在强边缘处约束
+    # 每张图动态取高梯度分位（比如 top 30%）
+    q = torch.quantile(edge_mag.view(edge_mag.size(0), -1), 0.70, dim=1, keepdim=True)  # 0.6~0.8 可调
+    q = q.view(-1, 1, 1, 1)
+    mask = (edge_mag > q).float()
 
     l = ( (gx_p - gx_g).abs() + (gy_p - gy_g).abs() ) * mask
     return weight * l.mean()
@@ -62,51 +92,46 @@ def edge_consistency_loss(geom_from_zs, depth_gt, weight=0.1):
 
 
 class EdgeConsistencyLoss(nn.Module):
-    """
-    让 Geometry-from-zs 的边缘/梯度和 GT 深度的边缘一致。
-    返回未加权的标量；权重在 CompositeLoss.total_loss 中统一乘。
-    """
-    def __init__(self):
+    def __init__(self, levels: int = 3, eps: float = 1e-3):
         super().__init__()
-        # 注册 Sobel 核为 buffer，自动随模型搬到对应设备/精度
+        self.levels = levels
+        self.eps = eps
         kx = torch.tensor([[1,0,-1],[2,0,-2],[1,0,-1]], dtype=torch.float32).view(1,1,3,3)
         ky = kx.transpose(2,3).contiguous()
         self.register_buffer("sobel_x", kx)
         self.register_buffer("sobel_y", ky)
 
-    def _normalize(self, x: torch.Tensor, eps: float = 1e-6):
-        # 每张图做简单 z-score，避免尺度影响（允许对 geom_pred 反传梯度）
-        m = x.mean(dim=(2,3), keepdim=True)
-        s = x.std (dim=(2,3), keepdim=True)
-        return (x - m) / (s + eps)
-
-    def _grads(self, x: torch.Tensor):
+    def _grad(self, x: torch.Tensor):
         gx = F.conv2d(x, self.sobel_x.to(x.dtype), padding=1)
         gy = F.conv2d(x, self.sobel_y.to(x.dtype), padding=1)
         return gx, gy
 
-    def forward(self, geom_pred: torch.Tensor, depth_gt: torch.Tensor) -> torch.Tensor:
-        """
-        geom_pred: [B,1,H,W] （你的 Geometry-from-zs probe：outputs['recon_geom']）
-        depth_gt : [B,1,H_gt,W_gt] 或 [B,H_gt,W_gt]
-        """
-        # 对齐分辨率到 geom_pred
-        if depth_gt.dim() == 3:
-            depth_gt = depth_gt.unsqueeze(1)
-        if geom_pred.dim() == 3:
-            geom_pred = geom_pred.unsqueeze(1)
-        if depth_gt.shape[-2:] != geom_pred.shape[-2:]:
-            depth_gt = F.interpolate(depth_gt, size=geom_pred.shape[-2:], mode="bilinear", align_corners=False)
+    def _charbonnier(self, x: torch.Tensor):
+        return torch.sqrt(x * x + self.eps * self.eps)
 
-        # 归一化到相近尺度
-        g = self._normalize(geom_pred)
-        d = self._normalize(depth_gt)
+    def forward(self, pred_depth: torch.Tensor, gt_depth: torch.Tensor) -> torch.Tensor:
+        if pred_depth.dim() == 3: pred_depth = pred_depth.unsqueeze(1)
+        if gt_depth.dim()  == 3:  gt_depth  = gt_depth.unsqueeze(1)
+        if gt_depth.shape[-2:] != pred_depth.shape[-2:]:
+            gt_depth = F.interpolate(gt_depth, size=pred_depth.shape[-2:], mode="nearest")  # ★ 保边
 
-        # 取 Sobel 梯度并做 L1 差
-        gx_g, gy_g = self._grads(g)
-        gx_d, gy_d = self._grads(d)
-        loss = (gx_g - gx_d).abs().mean() + (gy_g - gy_d).abs().mean()
+        # log-depth 更关注相对变化
+        pd = torch.log1p(torch.clamp(pred_depth, min=0))
+        gd = torch.log1p(torch.clamp(gt_depth , min=0))
+
+        loss = 0.0
+        pd_ms, gd_ms = pd, gd
+        for _ in range(self.levels):
+            gx_p, gy_p = self._grad(pd_ms)
+            gx_g, gy_g = self._grad(gd_ms)
+            # Charbonnier 代替 L1，边缘梯度更稳定
+            loss = loss + self._charbonnier(gx_p - gx_g).mean() + self._charbonnier(gy_p - gy_g).mean()
+            # 下一尺度（平均池化）
+            if _ < self.levels - 1:
+                pd_ms = F.avg_pool2d(pd_ms, 2, 2)
+                gd_ms = F.avg_pool2d(gd_ms, 2, 2)
         return loss
+
 
 class CompositeLoss(nn.Module):
     def __init__(self, loss_weights):
@@ -164,6 +189,52 @@ class CompositeLoss(nn.Module):
 
         # --- 3. Reconstruction Loss (Main and Auxiliary) ---
         # Main reconstruction loss
+        A = outputs.get('albedo', None)
+        S = outputs.get('shading', None)
+        Nn = outputs.get('normals', None)
+        I_hat = outputs.get('recon_decomp', None)
+
+        # 只有当模型已输出这些键时才启用；否则这些项为0，不影响现有训练
+        l_img = torch.tensor(0.0, device=outputs['pred_depth'].device)
+        l_alb_tv = torch.tensor(0.0, device=outputs['pred_depth'].device)
+        l_alb_chroma = torch.tensor(0.0, device=outputs['pred_depth'].device)
+        l_sh_gray = torch.tensor(0.0, device=outputs['pred_depth'].device)
+        l_norm = torch.tensor(0.0, device=outputs['pred_depth'].device)
+        l_xcov = torch.tensor(0.0, device=outputs['pred_depth'].device)
+
+        if (A is not None) and (S is not None) and (I_hat is not None):
+            # 选择重构目标：优先用 appearance_target；没有就回退到原图（若你把原图放在 targets['image']）
+            target_img = targets.get('appearance_target', targets.get('image', None))
+            if target_img is not None:
+                l_img = F.l1_loss(srgb_to_linear(I_hat), srgb_to_linear(target_img))
+
+            # 反照率平滑 + 色度平滑（Lab 的 ab 通道）
+            l_alb_tv = total_variation_l1(A)
+            Lab = rgb_to_lab_safe(A)
+            # 如果没有 kornia，这里就是对 RGB 做 TV，效果会弱一点但可跑
+            l_alb_chroma = total_variation_l1(Lab[:, 1:]) if Lab.shape[1] >= 3 else total_variation_l1(A)
+
+            # Shading 近灰：三通道差异越小越好
+            l_sh_gray = ((S[:, 0] - S[:, 1]) ** 2 + (S[:, 1] - S[:, 2]) ** 2).mean()
+
+        if Nn is not None:
+            l_norm_unit = (Nn.norm(dim=1) - 1).abs().mean()
+            l_norm_smooth = total_variation_l1(Nn)
+            l_norm = l_norm_unit + l_norm_smooth
+
+        if (A is not None) and (Nn is not None):
+            l_xcov = cross_covariance_abs(A, Nn)
+
+        # 记录日志
+        loss_dict.update({
+            'decomp_img': l_img,
+            'decomp_alb_tv': l_alb_tv,
+            'decomp_alb_chroma': l_alb_chroma,
+            'decomp_sh_gray': l_sh_gray,
+            'decomp_norm': l_norm,
+            'decomp_xcov': l_xcov,
+        })
+
         l_recon_g = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
         #l_recon_a = self.recon_app_loss(outputs['recon_app'], targets['appearance_target'])
         l_recon_a_lpips = self.recon_app_loss_lpips(outputs['recon_app'], targets['appearance_target'])
@@ -180,7 +251,8 @@ class CompositeLoss(nn.Module):
         aux_size_g = recon_geom_aux.shape[2:]
         aux_size_a = recon_app_aux.shape[2:]
 
-        target_depth_aux = F.interpolate(targets['depth'], size=aux_size_g, mode='bilinear', align_corners=False)
+        target_depth_aux = F.interpolate(targets['depth'], size=aux_size_g, mode='nearest')  # ★ 保边
+        #target_depth_aux = F.interpolate(targets['depth'], size=aux_size_g, mode='bilinear', align_corners=False)
         target_app_aux = F.interpolate(targets['appearance_target'], size=aux_size_a, mode='bilinear',
                                        align_corners=False)
 
@@ -203,6 +275,8 @@ class CompositeLoss(nn.Module):
         edge_w = self.weights.get('alpha_recon_geom_edges', 0.1)
         seg_edge_w = self.weights.get('beta_seg_edge_from_geom', 0.1)
         # --- 4. Total Loss ---
+        stage = int(outputs.get('stage', 2))
+        edge_scale = 0.0 if stage == 1 else 1.0
         total_loss = ((l_task +
                       #self.weights.get('lambda_independence', 0) * l_ind +
                       self.weights.get('alpha_recon_geom', 0) * l_recon_g +
@@ -210,9 +284,9 @@ class CompositeLoss(nn.Module):
                       self.weights.get('alpha_recon_geom_aux', 0) * l_recon_g_aux +
                       self.weights.get('beta_recon_app_aux', 0) * l_recon_a_aux+
                       self.weights.get('lambda_depth_zp', 0) * l_depth_from_zp)+
-                      self.weights.get('lambda_edge_consistency', 0.0) * l_edge+
+                      edge_scale * self.weights.get('lambda_edge_consistency', 0.0) * l_edge+
                       edge_consistency_loss(outputs['recon_geom'], targets['depth'], weight=edge_w)+
-                      seg_edge_consistency_loss(outputs['pred_seg'],outputs['recon_geom'],weight=seg_edge_w))
+                      edge_scale * seg_edge_consistency_loss(outputs['pred_seg'],outputs['recon_geom'],weight=seg_edge_w))
 
         warmup_ratio = min(1.0, self.current_epoch / max(1, self.ind_warmup_epochs))
         lambda_ind = self.lambda_ind_base * warmup_ratio
@@ -305,8 +379,16 @@ class AdaptiveCompositeLoss(nn.Module):
         cka_depth = self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True))
         cka_scene = self.independence_loss(z_s_centered, z_p_scene - z_p_scene.mean(0, keepdim=True))
 
+        # l_ind = cka_seg + cka_depth + cka_scene
+        # loss_ind = self._uw('ind', l_ind)
+        stage = int(outputs.get('stage', 2))
+
         l_ind = cka_seg + cka_depth + cka_scene
-        loss_ind = self._uw('ind', l_ind)
+        if stage ==1:
+            loss_ind = torch.zeros_like(l_ind)
+        else:
+            loss_ind = self._uw('ind', l_ind)
+
 
         # ✅ 恢复三个 CKA 明细，避免 evaluator 回退 0.0
         loss_dict['cka_seg']   = cka_seg
@@ -326,6 +408,46 @@ class AdaptiveCompositeLoss(nn.Module):
         loss_dict.update({
             'recon_geom_loss': l_recon_g,
             'recon_app_loss':  l_recon_a,
+        })
+        _dev = outputs['pred_depth'].device if 'pred_depth' in outputs else next(
+            v.device for v in outputs.values() if torch.is_tensor(v))
+
+        A = outputs.get('albedo', None)
+        S = outputs.get('shading', None)
+        Nn = outputs.get('normals', None)
+        I_hat = outputs.get('recon_decomp', None)
+
+        # 默认0，保证即使没启用分解分支也不报错
+        l_img = torch.tensor(0.0, device=_dev)
+        l_alb_tv = torch.tensor(0.0, device=_dev)
+        l_alb_chroma = torch.tensor(0.0, device=_dev)
+        l_sh_gray = torch.tensor(0.0, device=_dev)
+        l_norm = torch.tensor(0.0, device=_dev)
+        l_xcov = torch.tensor(0.0, device=_dev)
+
+        if (A is not None) and (S is not None) and (I_hat is not None):
+            target_img = targets.get('appearance_target', targets.get('image', None))
+            if target_img is not None:
+                l_img = F.l1_loss(srgb_to_linear(I_hat), srgb_to_linear(target_img))
+            l_alb_tv = total_variation_l1(A)
+            Lab = rgb_to_lab_safe(A)
+            l_alb_chroma = total_variation_l1(Lab[:, 1:]) if Lab.shape[1] >= 3 else total_variation_l1(A)
+            l_sh_gray = ((S[:, 0] - S[:, 1]) ** 2 + (S[:, 1] - S[:, 2]) ** 2).mean()
+
+        if Nn is not None:
+            l_norm = (Nn.norm(dim=1) - 1).abs().mean() + total_variation_l1(Nn)
+
+        if (A is not None) and (Nn is not None):
+            l_xcov = cross_covariance_abs(A, Nn)
+
+        # 记录日志（可选）
+        loss_dict.update({
+            'decomp_img': l_img,
+            'decomp_alb_tv': l_alb_tv,
+            'decomp_alb_chroma': l_alb_chroma,
+            'decomp_sh_gray': l_sh_gray,
+            'decomp_norm': l_norm,
+            'decomp_xcov': l_xcov,
         })
 
         # ===== 4) 重建（辅助，静态） =====
@@ -367,7 +489,16 @@ class AdaptiveCompositeLoss(nn.Module):
             self.weights.get('lambda_edge_consistency', 0.0) * l_edge +
             # 只保留这条：seg 边缘一致性（功能性项）
             seg_edge_consistency_loss(outputs['pred_seg'], outputs['recon_geom'], weight=seg_edge_w)
+            + self.weights.get('lambda_img', 0.0) * l_img
+            + self.weights.get('lambda_alb_tv', 0.0) * l_alb_tv
+            + self.weights.get('lambda_alb_chroma', 0.0) * l_alb_chroma
+            + self.weights.get('lambda_sh_gray', 0.0) * l_sh_gray
+            + self.weights.get('lambda_norm', 0.0) * l_norm
+            + self.weights.get('lambda_xcov', 0.0) * l_xcov
         )
+
+
+
 
         loss_dict['total_loss'] = total_loss
         return total_loss, loss_dict
