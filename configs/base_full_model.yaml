@@ -75,9 +75,13 @@ losses:
   lambda_depth_zp: 1.0           # z_p_depth 辅助深度监督
 
   # === 几何/分割边缘一致性（原有） ===
+  lambda_depth_edge_weight_alpha: 2.0
+  lambda_depth_edge_weight_q: 0.7      # 选取 GT 边缘最高的 30% 像素
+  lambda_depth_edge_weight_mix: 0.5
   lambda_edge_consistency: 0.5
   alpha_recon_geom_edges: 0.5
-  beta_seg_edge_from_geom: 0.5
+  beta_seg_edge_from_geom: 1.5
+  lambda_main_depth_edge: 4.0
 
   # === ★ 新增：分解式重构（Albedo × Shading）相关权重（默认都为0，逐步打开） ===
   lambda_img: 1.0               # I_hat(A×S) 与目标图的 L1（线性色域）

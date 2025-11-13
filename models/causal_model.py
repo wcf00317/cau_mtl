@@ -71,7 +71,8 @@ class GatedSegDepthDecoder(nn.Module):
         def _up(in_c, out_c, do_resize=True):
             layers = []
             if do_resize:
-                layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+                #layers.append(nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False))
+                layers.append(nn.Upsample(scale_factor=2, mode='nearest'))
             layers += [
                 nn.Conv2d(in_c, out_c, 3, padding=1, bias=False),
                 nn.BatchNorm2d(out_c),

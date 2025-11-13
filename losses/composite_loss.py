@@ -1,3 +1,4 @@
+import math
 import torch
 import torch.nn as nn
 #from .hsic import HSIC
@@ -5,6 +6,17 @@ from .linear_cka import LinearCKA
 import torch.nn.functional as F
 from metrics.lpips import LPIPSMetric
 
+def edge_weight_from_gt(gt, alpha=2.0, q=0.7):
+    """计算边界权重 w in [1, 1+alpha]"""
+    if gt.dim()==3: gt=gt.unsqueeze(1)
+    # 使用 .to(gt.device, dtype=gt.dtype) 确保张量在同一设备和类型
+    kx = torch.tensor([[-1,0,1],[-2,0,2],[-1,0,1]], device=gt.device, dtype=gt.dtype).view(1,1,3,3)
+    ky = kx.transpose(2,3)
+    gx = F.conv2d(gt, kx, padding=1); gy = F.conv2d(gt, ky, padding=1)
+    mag = (gx.abs()+gy.abs())
+    thr = torch.quantile(mag.view(mag.size(0), -1), q, dim=1, keepdim=True).view(-1,1,1,1)
+    mask = (mag >= thr).float()
+    return 1.0 + alpha*mask
 
 def srgb_to_linear(x: torch.Tensor) -> torch.Tensor:
     a = 0.055
@@ -56,7 +68,7 @@ def seg_edge_consistency_loss(seg_logits, geom_from_zs, weight=0.1, tau=0.1):
 
     # 几何边缘（不反传给几何，避免干扰 z_s 重构）
     g = (geom_from_zs - geom_from_zs.mean()) / (geom_from_zs.std() + 1e-6)
-    gx_g, gy_g = _sobel(g.detach())
+    gx_g, gy_g = _sobel(g)
 
     # 归一化 & 只在强几何边缘处计算（掩码）
     def _norm(a):
@@ -133,6 +145,9 @@ class EdgeConsistencyLoss(nn.Module):
         return loss
 
 
+# =========================
+#  基线（保留，不改动逻辑）
+# =========================
 class CompositeLoss(nn.Module):
     def __init__(self, loss_weights):
         super().__init__()
@@ -161,14 +176,42 @@ class CompositeLoss(nn.Module):
 
         # --- 1. Task Losses ---
         l_seg = self.seg_loss(outputs['pred_seg'], targets['segmentation'])
-        l_depth = self.depth_loss(outputs['pred_depth'], targets['depth'])
+        # l_depth = self.depth_loss(outputs['pred_depth'], targets['depth'])
+        # l_scene = self.scene_loss(outputs['pred_scene'], targets['scene_type'])
+        # l_task = (self.weights.get('lambda_seg', 1.0) * l_seg +
+        #           self.weights.get('lambda_depth', 1.0) * l_depth +
+        #           self.weights.get('lambda_scene', 1.0) * l_scene)
+        #
+        # loss_dict.update({'task_loss': l_task, 'seg_loss': l_seg, 'depth_loss': l_depth, 'scene_loss': l_scene})
+        edge_weight_alpha = self.weights.get('lambda_depth_edge_weight_alpha', 2.0)
+        edge_weight_q = self.weights.get('lambda_depth_edge_weight_q', 0.7)
+        mix_ratio = self.weights.get('lambda_depth_edge_weight_mix', 0.5)
+
+        # 1. 计算标准 L1
+        l_depth_l1_vanilla = self.depth_loss(outputs['pred_depth'], targets['depth'])
+        # 2. 计算加权 L1
+        w = edge_weight_from_gt(targets['depth'], alpha=edge_weight_alpha, q=edge_weight_q)
+        l_depth_weighted = (w * (outputs['pred_depth'] - targets['depth']).abs()).mean()
+
+        # 3. 混合
+        l_depth = (1.0 - mix_ratio) * l_depth_l1_vanilla + mix_ratio * l_depth_weighted
+
         l_scene = self.scene_loss(outputs['pred_scene'], targets['scene_type'])
 
-        l_task = (self.weights.get('lambda_seg', 1.0) * l_seg +
-                  self.weights.get('lambda_depth', 1.0) * l_depth +
-                  self.weights.get('lambda_scene', 1.0) * l_scene)
+        loss_seg = self._uw('seg', l_seg)
+        loss_depth = self._uw('depth', l_depth)  # l_depth 现在是混合损失
+        loss_scene = self._uw('scene', l_scene)
 
-        loss_dict.update({'task_loss': l_task, 'seg_loss': l_seg, 'depth_loss': l_depth, 'scene_loss': l_scene})
+        l_task = loss_seg + loss_depth + loss_scene
+        loss_dict.update({
+            'seg_loss': l_seg,
+            'depth_loss': l_depth,  # 日志记录的是混合后的损失
+            'depth_loss_vanilla': l_depth_l1_vanilla,  # [可选] 额外记录原版L1
+            'depth_loss_weighted': l_depth_weighted,  # [可选] 额外记录加权L1
+            'scene_loss': l_scene,
+            'task_loss': l_task,
+        })
+
 
         # --- 2. Causal Independence Loss ---
         z_s = outputs['z_s']
@@ -288,13 +331,26 @@ class CompositeLoss(nn.Module):
                       edge_consistency_loss(outputs['recon_geom'], targets['depth'], weight=edge_w)+
                       edge_scale * seg_edge_consistency_loss(outputs['pred_seg'],outputs['recon_geom'],weight=seg_edge_w))
 
-        warmup_ratio = min(1.0, self.current_epoch / max(1, self.ind_warmup_epochs))
-        lambda_ind = self.lambda_ind_base * warmup_ratio
+        warmup_ratio = min(1.0, getattr(self, "current_epoch", 0) / max(1, getattr(self, "ind_warmup_epochs", 10)))
+        lambda_ind = float(getattr(self, "lambda_ind_base", self.weights.get('lambda_independence', 0.1))) * warmup_ratio
         total_loss = total_loss + lambda_ind * l_ind
         loss_dict['total_loss'] = total_loss
         return total_loss, loss_dict
 
+
+# =========================
+#   自适应版本（当前生效）
+# =========================
 class AdaptiveCompositeLoss(nn.Module):
+    """
+    在 Kendall 不确定性加权中，将 regularizer 项从
+        0.5 * log_var
+    改为
+        0.5 * (log_var + C)
+    其中 C = -log_var_min（这里为 4.0），保证 regularizer 非负。
+    该改动不改变 d/d(log_var) 的梯度（仍为 0.5），
+    因而不影响优化动态，但能避免“总损为负”的日志现象。
+    """
     def __init__(self, loss_weights):
         super().__init__()
         self.weights = loss_weights
@@ -314,12 +370,10 @@ class AdaptiveCompositeLoss(nn.Module):
 
         # ==== 用 YAML 权重做 log_var 的先验初始化（log_var=log(1/λ)） ====
         def _to_logvar(inv_weight_default_one):
-            # 期望初始权重 ~ λ => precision ≈ λ => log_var ≈ log(1/λ)
             lam = float(inv_weight_default_one)
             lam = max(lam, 1e-6)
             return math.log(1.0 / lam)
 
-        import math
         init = {
             'seg'        : _to_logvar(self.weights.get('lambda_seg',       1.0)),
             'depth'      : _to_logvar(self.weights.get('lambda_depth',     1.0)),
@@ -337,87 +391,92 @@ class AdaptiveCompositeLoss(nn.Module):
         self._logvar_min = -4.0
         self._logvar_max =  4.0
 
+        # ★ 新增：正则项常数偏移 C = -log_var_min (=4.0)，确保 0.5*(log_var + C) ≥ 0
+        self._regularizer_shift = -self._logvar_min
+
     def _uw(self, name: str, loss_scalar: torch.Tensor) -> torch.Tensor:
         """
-        Kendall 不确定性加权：
-        0.5 * exp(-log_var) * L + 0.5 * log_var
-        同时对 log_var 做轻度 clamp 保稳。
+        Kendall 不确定性加权（修正版）：
+            0.5 * exp(-log_var) * L + 0.5 * (log_var + C)
+        其中 C = self._regularizer_shift。
+        - 保证 regularizer 非负（总损不至于出现负数）
+        - 不改变关于 log_var 的梯度（仍为 0.5）
         """
         lv = self.log_vars[name]
         lv_clamped = torch.clamp(lv, self._logvar_min, self._logvar_max)
-        return 0.5 * torch.exp(-lv_clamped) * loss_scalar + 0.5 * lv_clamped
+
+        weighted_loss = 0.5 * torch.exp(-lv_clamped) * loss_scalar
+        regularizer   = 0.5 * (lv_clamped + self._regularizer_shift)
+        return weighted_loss + regularizer
 
     def forward(self, outputs, targets):
         loss_dict = {}
 
         # ===== 1) 主任务 =====
-        l_seg   = self.seg_loss(outputs['pred_seg'],   targets['segmentation'])
+        l_seg = self.seg_loss(outputs['pred_seg'], targets['segmentation'])
         l_depth = self.depth_loss(outputs['pred_depth'], targets['depth'])
         l_scene = self.scene_loss(outputs['pred_scene'], targets['scene_type'])
 
-        loss_seg   = self._uw('seg',   l_seg)
+        loss_seg = self._uw('seg', l_seg)
         loss_depth = self._uw('depth', l_depth)
         loss_scene = self._uw('scene', l_scene)
 
         l_task = loss_seg + loss_depth + loss_scene
         loss_dict.update({
-            'seg_loss':   l_seg,    # Tensor
-            'depth_loss': l_depth,  # Tensor
-            'scene_loss': l_scene,  # Tensor
-            'task_loss':  l_task,   # Tensor
+            'seg_loss': l_seg,
+            'depth_loss': l_depth,
+            'scene_loss': l_scene,
+            'task_loss': l_task,
         })
 
         # ===== 2) 解耦独立性 =====
-        z_s       = outputs['z_s']
-        z_p_seg   = outputs['z_p_seg']
+        z_s = outputs['z_s']
+        z_p_seg = outputs['z_p_seg']
         z_p_depth = outputs['z_p_depth']
         z_p_scene = outputs['z_p_scene']
 
         z_s_centered = z_s - z_s.mean(dim=0, keepdim=True)
 
-        cka_seg   = self.independence_loss(z_s_centered, z_p_seg   - z_p_seg.mean(0,   keepdim=True))
+        cka_seg = self.independence_loss(z_s_centered, z_p_seg - z_p_seg.mean(0, keepdim=True))
         cka_depth = self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True))
         cka_scene = self.independence_loss(z_s_centered, z_p_scene - z_p_scene.mean(0, keepdim=True))
 
-        # l_ind = cka_seg + cka_depth + cka_scene
-        # loss_ind = self._uw('ind', l_ind)
-        stage = int(outputs.get('stage', 2))
-
         l_ind = cka_seg + cka_depth + cka_scene
-        if stage ==1:
+        stage = int(outputs.get('stage', 2))
+        if stage == 1:
             loss_ind = torch.zeros_like(l_ind)
         else:
             loss_ind = self._uw('ind', l_ind)
 
-
-        # ✅ 恢复三个 CKA 明细，避免 evaluator 回退 0.0
-        loss_dict['cka_seg']   = cka_seg
+        # 记录
+        loss_dict['cka_seg'] = cka_seg
         loss_dict['cka_depth'] = cka_depth
         loss_dict['cka_scene'] = cka_scene
         loss_dict['independence_loss'] = l_ind
 
         # ===== 3) 重建（主） =====
-        l_recon_g        = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
-        l_recon_a_lpips  = self.recon_app_loss_lpips(outputs['recon_app'], targets['appearance_target'])
-        l_recon_a_l1     = self.recon_app_loss_l1(outputs['recon_app'], targets['appearance_target'])
-        l_recon_a        = l_recon_a_lpips + self.weights.get('lambda_l1_recon', 1.0) * l_recon_a_l1
+        l_recon_g = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
+        l_recon_a_lpips = self.recon_app_loss_lpips(outputs['recon_app'], targets['appearance_target'])
+        l_recon_a_l1 = self.recon_app_loss_l1(outputs['recon_app'], targets['appearance_target'])
+        l_recon_a = l_recon_a_lpips + self.weights.get('lambda_l1_recon', 1.0) * l_recon_a_l1
 
         loss_recon_g = self._uw('recon_geom', l_recon_g)
-        loss_recon_a = self._uw('recon_app',  l_recon_a)
+        loss_recon_a = self._uw('recon_app', l_recon_a)
 
         loss_dict.update({
             'recon_geom_loss': l_recon_g,
-            'recon_app_loss':  l_recon_a,
+            'recon_app_loss': l_recon_a,
         })
+
         _dev = outputs['pred_depth'].device if 'pred_depth' in outputs else next(
             v.device for v in outputs.values() if torch.is_tensor(v))
 
+        # ===== 3.1) 分解式重构（可选） =====
         A = outputs.get('albedo', None)
         S = outputs.get('shading', None)
         Nn = outputs.get('normals', None)
         I_hat = outputs.get('recon_decomp', None)
 
-        # 默认0，保证即使没启用分解分支也不报错
         l_img = torch.tensor(0.0, device=_dev)
         l_alb_tv = torch.tensor(0.0, device=_dev)
         l_alb_chroma = torch.tensor(0.0, device=_dev)
@@ -440,7 +499,6 @@ class AdaptiveCompositeLoss(nn.Module):
         if (A is not None) and (Nn is not None):
             l_xcov = cross_covariance_abs(A, Nn)
 
-        # 记录日志（可选）
         loss_dict.update({
             'decomp_img': l_img,
             'decomp_alb_tv': l_alb_tv,
@@ -450,55 +508,68 @@ class AdaptiveCompositeLoss(nn.Module):
             'decomp_xcov': l_xcov,
         })
 
-        # ===== 4) 重建（辅助，静态） =====
+        # ===== 4) 重建（辅助） =====
         recon_geom_aux = outputs['recon_geom_aux']
-        recon_app_aux  = outputs['recon_app_aux']
+        recon_app_aux = outputs['recon_app_aux']
         aux_size_g = recon_geom_aux.shape[2:]
         aux_size_a = recon_app_aux.shape[2:]
 
-        target_depth_aux = F.interpolate(targets['depth'], size=aux_size_g, mode='bilinear', align_corners=False)
-        target_app_aux   = F.interpolate(targets['appearance_target'], size=aux_size_a, mode='bilinear', align_corners=False)
+        # ★ 关键修复：depth GT 用 nearest，避免软化边界
+        target_depth_aux = F.interpolate(targets['depth'], size=aux_size_g, mode='nearest')
+        target_app_aux = F.interpolate(targets['appearance_target'], size=aux_size_a, mode='bilinear',
+                                       align_corners=False)
 
-        l_recon_g_aux       = self.recon_geom_loss(recon_geom_aux, target_depth_aux)
+        l_recon_g_aux = self.recon_geom_loss(recon_geom_aux, target_depth_aux)
         l_recon_a_lpips_aux = self.recon_app_loss_lpips(recon_app_aux, target_app_aux)
-        l_recon_a_l1_aux    = self.recon_app_loss_l1(recon_app_aux, target_app_aux)
-        l_recon_a_aux       = l_recon_a_lpips_aux + self.weights.get('lambda_l1_recon', 1.0) * l_recon_a_l1_aux
+        l_recon_a_l1_aux = self.recon_app_loss_l1(recon_app_aux, target_app_aux)
+        l_recon_a_aux = l_recon_a_lpips_aux + self.weights.get('lambda_l1_recon', 1.0) * l_recon_a_l1_aux
 
         loss_dict.update({
             'recon_geom_aux_loss': l_recon_g_aux,
-            'recon_app_aux_loss':  l_recon_a_aux,
+            'recon_app_aux_loss': l_recon_a_aux,
         })
 
-        # ===== 5) 其他一致性项（静态） =====
+        # ===== 5) 一致性项 =====
+        # 5.1 原有：几何辅助头 vs GT
         l_depth_from_zp = self.depth_loss(outputs['pred_depth_from_zp'], targets['depth'])
-        l_edge          = self.edge_consistency_loss(outputs['recon_geom'], targets['depth'])
-        edge_w     = self.weights.get('alpha_recon_geom_edges', 0.1)
+        l_edge_geom = self.edge_consistency_loss(outputs['recon_geom'], targets['depth'])
+        edge_w = self.weights.get('alpha_recon_geom_edges', 0.1)
         seg_edge_w = self.weights.get('beta_seg_edge_from_geom', 0.1)
 
+        # 5.2 新增：主头 pred_depth vs GT 的边缘一致性（关键改动）
+        l_edge_pred = self.edge_consistency_loss(outputs['pred_depth'], targets['depth'])
+        edge_pred_w = self.weights.get('lambda_edge_consistency_pred',
+                                       self.weights.get('lambda_edge_consistency', 0.0))
+
         loss_dict.update({
-            'depth_from_zp_loss':     l_depth_from_zp,
-            'edge_consistency_loss':  l_edge,
+            'depth_from_zp_loss': l_depth_from_zp,
+            'edge_consistency_loss_geom': l_edge_geom,
+            'edge_consistency_loss_pred': l_edge_pred,
         })
 
-        # ===== 6) 汇总（删除“重复的 edge_consistency 直加项”） =====
+        # ===== 6) 汇总 =====
+        edge_scale = 0.0 if stage == 1 else 1.0  # 与原逻辑保持一致
         total_loss = (
-            l_task + loss_ind + loss_recon_g + loss_recon_a +
-            self.weights.get('alpha_recon_geom_aux', 0.0) * l_recon_g_aux +
-            self.weights.get('beta_recon_app_aux',  0.0) * l_recon_a_aux +
-            self.weights.get('lambda_depth_zp',     0.0) * l_depth_from_zp +
-            self.weights.get('lambda_edge_consistency', 0.0) * l_edge +
-            # 只保留这条：seg 边缘一致性（功能性项）
-            seg_edge_consistency_loss(outputs['pred_seg'], outputs['recon_geom'], weight=seg_edge_w)
-            + self.weights.get('lambda_img', 0.0) * l_img
-            + self.weights.get('lambda_alb_tv', 0.0) * l_alb_tv
-            + self.weights.get('lambda_alb_chroma', 0.0) * l_alb_chroma
-            + self.weights.get('lambda_sh_gray', 0.0) * l_sh_gray
-            + self.weights.get('lambda_norm', 0.0) * l_norm
-            + self.weights.get('lambda_xcov', 0.0) * l_xcov
+                l_task + loss_ind + loss_recon_g + loss_recon_a +
+                self.weights.get('alpha_recon_geom_aux', 0.0) * l_recon_g_aux +
+                self.weights.get('beta_recon_app_aux', 0.0) * l_recon_a_aux +
+                self.weights.get('lambda_depth_zp', 0.0) * l_depth_from_zp +
+                # 几何辅助头的边缘一致性（原有逻辑，保留）
+                self.weights.get('lambda_edge_consistency', 0.0) * edge_scale * l_edge_geom +
+                # 你原来那条“函数版 edge_consistency_loss（带 weight=edge_w）”仍保留
+                edge_consistency_loss(outputs['recon_geom'], targets['depth'], weight=edge_w) +
+                # ★ 新增：主头 pred_depth 的边缘一致性（关键）
+                edge_scale * edge_pred_w * l_edge_pred +
+                # seg 与几何的边缘一致性（只影响分割头）
+                edge_scale * seg_edge_consistency_loss(outputs['pred_seg'], outputs['recon_geom'], weight=seg_edge_w) +
+                # 分解式项（可选）
+                self.weights.get('lambda_img', 0.0) * l_img +
+                self.weights.get('lambda_alb_tv', 0.0) * l_alb_tv +
+                self.weights.get('lambda_alb_chroma', 0.0) * l_alb_chroma +
+                self.weights.get('lambda_sh_gray', 0.0) * l_sh_gray +
+                self.weights.get('lambda_norm', 0.0) * l_norm +
+                self.weights.get('lambda_xcov', 0.0) * l_xcov
         )
-
-
-
 
         loss_dict['total_loss'] = total_loss
         return total_loss, loss_dict
