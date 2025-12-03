@@ -8,12 +8,13 @@ import torchvision.models as models
 from torchvision.models.vision_transformer import VisionTransformer
 
 
-# ViTEncoder remains the same as above, correctly extracting the 14x14 grid
 class ViTEncoder(nn.Module):
-    # ... (Code from above, no changes needed here)
     """
-    A wrapper for the Vision Transformer to extract patch token features.
-    This is the proper way to use ViT for dense prediction tasks.
+    A wrapper for the Vision Transformer to extract multi-scale patch token features.
+
+    功能升级：
+    1. [工程] 严格根据 img_size (224/384) 自动匹配最佳预训练权重 (DEFAULT/SWAG)。
+    2. [架构] 返回多层特征列表 (indices: 2, 5, 8, 11) 以支持高分辨率解码。
     """
 
     def __init__(self, name="vit_b_16", pretrained=True, img_size=224, patch_size=16):
@@ -22,11 +23,23 @@ class ViTEncoder(nn.Module):
         self.patch_size = patch_size
         self.grid_size = img_size // patch_size
 
-        # Load the pretrained ViT model
         if name == "vit_b_16":
-            weights = models.ViT_B_16_Weights.DEFAULT if pretrained else None
+            weights = None
+            if pretrained:
+                if img_size == 384:
+                    # 384x384 输入，使用 SWAG 高分权重 (最佳推荐)
+                    weights = models.ViT_B_16_Weights.IMAGENET1K_SWAG_E2E_V1
+                    print(f"✅ [ViTEncoder] Using 384x384 pretrained weights (SWAG_E2E_V1).")
+                elif img_size == 224:
+                    # 兼容默认情况
+                    weights = models.ViT_B_16_Weights.DEFAULT
+                    print(f"✅ [ViTEncoder] Using 224x224 pretrained weights (DEFAULT).")
+                else:
+                    raise ValueError(f"For pretrained ViT, img_size must be 224 or 384. Got {img_size}.")
+
+            # 初始化模型，严格绑定 image_size
             self.vit: VisionTransformer = models.vit_b_16(weights=weights, image_size=img_size)
-            self.feature_dim = 768  # Output feature dimension for ViT-B
+            self.feature_dim = 768
         else:
             raise ValueError(f"Encoder '{name}' not supported.")
 
@@ -34,20 +47,42 @@ class ViTEncoder(nn.Module):
         self.vit.heads = nn.Identity()
 
     def forward(self, x):
+        # 1. 预处理 (torchvision 内部会检查输入尺寸是否匹配 img_size)
         x = self.vit._process_input(x)
+
+        # 2. 拼接 Class Token
         n = x.shape[0]
         batch_class_token = self.vit.class_token.expand(n, -1, -1)
         x = torch.cat([batch_class_token, x], dim=1)
+
+        # 3. 手动执行 Encoder Layers 以提取中间层特征
+        # 注意：torchvision 的 encoder 包含 pos_embedding + dropout + layers + ln
+
+        # 3.1 加位置编码 + Dropout
         x = x + self.vit.encoder.pos_embedding
-        x = self.vit.encoder(x)
-        patch_tokens = x[:, 1:, :]
-        b, _, c = patch_tokens.shape
-        patch_tokens = patch_tokens.permute(0, 2, 1)
-        patch_tokens = patch_tokens.view(b, c, self.grid_size, self.grid_size)
-        return patch_tokens
+        if hasattr(self.vit.encoder, 'dropout'):
+            x = self.vit.encoder.dropout(x)
 
+        features = []
+        # 定义要提取的层索引 (0-11)，这里取 [2, 5, 8, 11] 即第 3, 6, 9, 12 层
+        # 这种取法覆盖了低、中、高层语义
+        out_indices = [2, 5, 8, 11]
 
-# MLP remains the same
+        # 3.2 逐层前向传播
+        for i, layer in enumerate(self.vit.encoder.layers):
+            x = layer(x)
+
+            if i in out_indices:
+                # 提取 Patch Tokens (去掉 Class Token)
+                patch_tokens = x[:, 1:, :]
+                b, _, c = patch_tokens.shape
+
+                # 整理为 2D 特征图: [B, 768, H/16, W/16]
+                feat = patch_tokens.permute(0, 2, 1).view(b, c, self.grid_size, self.grid_size)
+                features.append(feat)
+
+        # 返回特征列表，最后一层 features[-1] 即为最高层特征
+        return features
 class MLP(nn.Module):
     # ... (Code from above, no changes needed here)
     """

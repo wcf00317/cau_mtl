@@ -329,7 +329,7 @@ class CompositeLoss(nn.Module):
                       self.weights.get('lambda_depth_zp', 0) * l_depth_from_zp)+
                       edge_scale * self.weights.get('lambda_edge_consistency', 0.0) * l_edge+
                       edge_consistency_loss(outputs['recon_geom'], targets['depth'], weight=edge_w)+
-                      edge_scale * seg_edge_consistency_loss(outputs['pred_seg'],outputs['recon_geom'],weight=seg_edge_w))
+                      edge_scale * seg_edge_consistency_loss(outputs['pred_seg'],outputs['depth'],weight=seg_edge_w))
 
         warmup_ratio = min(1.0, getattr(self, "current_epoch", 0) / max(1, getattr(self, "ind_warmup_epochs", 10)))
         lambda_ind = float(getattr(self, "lambda_ind_base", self.weights.get('lambda_independence', 0.1))) * warmup_ratio
