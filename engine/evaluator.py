@@ -22,9 +22,15 @@ def evaluate(model, val_loader, criterion, device, stage):
 
     miou_metric = torchmetrics.classification.MulticlassJaccardIndex(
         num_classes=num_seg_classes, ignore_index=255).to(device)
-    scene_acc_metric = torchmetrics.classification.MulticlassAccuracy(
-        num_classes=num_scene_classes).to(device)
+    pixel_acc_metric = torchmetrics.classification.MulticlassAccuracy(
+        num_classes=num_seg_classes, average='micro', ignore_index=255).to(device)
+    if num_scene_classes > 1:
+        scene_acc_metric = torchmetrics.classification.MulticlassAccuracy(
+            num_classes=num_scene_classes).to(device)
+    else:
+        scene_acc_metric = None  # 标记为 None
     depth_mse_metric = torchmetrics.regression.MeanSquaredError().to(device)
+    depth_abs_rel_metric = MeanAbsolutePercentageError().to(device)  # -> Abs Rel (等价于 MAPE)
     depth_mae_metric = torchmetrics.regression.MeanAbsoluteError().to(device)
 
     # --- 2. 跟踪损失 ---
@@ -60,11 +66,55 @@ def evaluate(model, val_loader, criterion, device, stage):
         total_cka_scene += loss_dict.get('cka_scene', torch.tensor(0.0)).item()
 
         miou_metric.update(outputs['pred_seg'], targets_on_device['segmentation'])
-        scene_acc_metric.update(outputs['pred_scene'], targets_on_device['scene_type'])
-        pred_depth = outputs['pred_depth']
-        gt_depth = targets_on_device['depth']
-        depth_mse_metric.update(pred_depth, gt_depth)
-        depth_mae_metric.update(pred_depth, gt_depth)
+        pixel_acc_metric.update(outputs['pred_seg'], targets_on_device['segmentation'])  # ★更新 Pixel Acc
+        if scene_acc_metric is not None:
+            scene_acc_metric.update(outputs['pred_scene'], targets_on_device['scene_type'])
+        if 'depth_meters' in targets_on_device:
+            # === Cityscapes 分支 ===
+            gt_depth_meters = targets_on_device['depth_meters']
+
+            # 1. 准备常数
+            # Cityscapes 深度常数 (baseline * focal * 256)
+            DEPTH_CONSTANT = 121246.75
+            MAX_EVAL_DEPTH = 80.0  # 学术界通用的评估上限
+
+            # 计算 80m 对应的最小归一化视差阈值
+            # depth = const / (norm_disp * 65535)
+            # -> min_norm_disp = const / (80 * 65535)
+            min_valid_disp = DEPTH_CONSTANT / (MAX_EVAL_DEPTH * 65535.0)
+
+            # 2. 获取模型预测 (归一化视差)
+            pred_disp_norm = outputs['pred_depth']
+
+            # 3. ★关键步骤★：限制最小视差，防止深度爆炸
+            # 任何导致深度 > 80m 的微小视差，都被截断，使其深度等于 80m
+            pred_disp_norm = torch.clamp(pred_disp_norm, min=min_valid_disp)
+
+            # 4. 转换为物理深度 (米)
+            pred_depth_meters = DEPTH_CONSTANT / (pred_disp_norm * 65535.0)
+
+            # 5. 双重保险：再次截断预测深度 (处理潜在的浮点误差)
+            pred_depth_meters = torch.clamp(pred_depth_meters, max=MAX_EVAL_DEPTH)
+
+            # 6. 生成有效掩码 (只评估 GT 在 0~80m 范围内的像素)
+            # 注意：必须过滤掉 GT 中的 -1 (无效值) 和 >80m 的值
+            valid_mask = (gt_depth_meters > 0) & (gt_depth_meters <= MAX_EVAL_DEPTH)
+
+            # 7. 计算指标
+            if valid_mask.sum() > 0:
+                # 只比较有效区域
+                p_valid = pred_depth_meters[valid_mask]
+                g_valid = gt_depth_meters[valid_mask]
+
+                depth_mse_metric.update(p_valid, g_valid)
+                depth_mae_metric.update(p_valid, g_valid)
+        else:
+            # === NYUv2 分支：直接是深度 ===
+            # NYUv2 的 target['depth'] 本身就是米，直接计算
+            pred_depth = outputs['pred_depth']
+            gt_depth = targets_on_device['depth']
+            depth_mse_metric.update(pred_depth, gt_depth)
+            depth_mae_metric.update(pred_depth, gt_depth)
 
     # --- 5. 平均 ---
     num_batches = max(1, len(val_loader))
@@ -79,9 +129,16 @@ def evaluate(model, val_loader, criterion, device, stage):
 
     # --- 6. 任务指标 ---
     final_miou = miou_metric.compute().item()
-    final_scene_acc = scene_acc_metric.compute().item()
+    final_pixel_acc = pixel_acc_metric.compute().item()
+
+    if scene_acc_metric is not None:
+        final_scene_acc = scene_acc_metric.compute().item()
+        scene_acc_metric.reset()
+    else:
+        final_scene_acc = 1.0
     final_rmse = torch.sqrt(depth_mse_metric.compute()).item()
     final_mae = depth_mae_metric.compute().item()
+    final_abs_rel = depth_abs_rel_metric.compute().item()
 
     # --- 7. 打印报告 ---
     logging.info("\n--- Validation Results ---")
@@ -94,13 +151,17 @@ def evaluate(model, val_loader, criterion, device, stage):
     logging.info(f"  - Geometry Recon Loss: {avg_recon_geom_loss:.4f}  <-- 几何清晰度指标")
     logging.info(f"  - Appearance Recon Loss: {avg_recon_app_loss:.4f}  <-- 外观清晰度指标")
     logging.info("\n-- Downstream Task Metrics --")
-    logging.info(f"  - Segmentation (mIoU): {final_miou:.4f}")
-    logging.info(f"  - Depth (RMSE): {final_rmse:.4f}")
-    logging.info(f"  - Scene Classification (Acc): {final_scene_acc:.4f}")
+    logging.info(f"  - Segmentation: mIoU={final_miou:.4f}, Pixel Acc={final_pixel_acc:.4f}")
+    logging.info(f"  - Depth:        RMSE={final_rmse:.4f}, MAE={final_mae:.4f}, Abs Rel={final_abs_rel:.4f}")
+    if scene_acc_metric is not None:
+        logging.info(f"  - Scene Classification (Acc): {final_scene_acc:.4f}")
+    else:
+        logging.info(f"  - Scene Classification (Acc): N/A (Single Class)")
     logging.info("--------------------------")
 
     miou_metric.reset()
-    scene_acc_metric.reset()
+    if scene_acc_metric is not None:
+        scene_acc_metric.reset()
     depth_mse_metric.reset()
     depth_mae_metric.reset()
 
@@ -109,7 +170,9 @@ def evaluate(model, val_loader, criterion, device, stage):
         'recon_geom_loss': avg_recon_geom_loss,
         'recon_app_loss': avg_recon_app_loss,
         'seg_miou': final_miou,
+        'seg_pixel_acc': final_pixel_acc,
         'depth_rmse': final_rmse,
+        'depth_abs_rel': final_abs_rel,
         'depth_mae': final_mae,
         'scene_acc': final_scene_acc
     }

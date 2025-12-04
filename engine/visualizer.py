@@ -4,6 +4,8 @@ import numpy as np
 import os
 from skimage.color import lab2rgb
 from torch.utils.data import Subset
+import torch.nn.functional as F
+from models.layers.shading import shading_from_normals
 
 
 # -----------------------------------------------------------------------------
@@ -76,40 +78,71 @@ def _visualize_microscope(model, batch, device, save_path, scene_class_map):
     plt.tight_layout(rect=[0, 0.03, 1, 0.93])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
+    print(f"  -> Saved Microscope: {save_path}")
 
 
 def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map):
     """
-    Swap Test: 验证 z_s 和 z_p 的解耦特性
+    Swap Test: 真正的物理交换 (Albedo * Shading)
+    【修复版】恢复6张图布局，增加 Albedo A 的显示，并修复 Shading 警告。
     """
     model.eval()
 
     # --- 1. 提取 A 和 B 的特征 ---
-    rgb_a = batch_a['rgb'][0].unsqueeze(0).to(device)
-    rgb_b = batch_b['rgb'][0].unsqueeze(0).to(device)
+    rgb_a = batch_a['rgb'][0:1].to(device)
+    rgb_b = batch_b['rgb'][0:1].to(device)
 
     with torch.no_grad():
-        out_a = model(rgb_a)
-        out_b = model(rgb_b)
+        # 获取特征图和潜变量
+        out_a = model(rgb_a, stage=2)
+        out_b = model(rgb_b, stage=2)
 
-        # 重构 A 的几何 (来自 z_s^A)
-        recon_geom_a, _ = model.decoder_geom(out_a['z_s_map'])
+        # === 核心修改：真正的生成式交换 ===
 
-        # 重构 A 的外观 (来自 z_p^A) - 直接 RGB
-        recon_app_a_logits, _ = model.decoder_app(out_a['z_p_seg_map'])
-        recon_app_a = torch.sigmoid(recon_app_a_logits)
+        # 1. 获取材质 (Albedo)
+        # B 的材质 (用于交换)
+        Albedo_B = model.albedo_head(out_b['z_p_seg_map'])
+        # 【新增】A 的材质 (用于填补右上角可视化，对比用)
+        Albedo_A = model.albedo_head(out_a['z_p_seg_map'])
 
-        # 重构 B 的外观 (来自 z_p^B)
-        recon_app_b_logits, _ = model.decoder_app(out_b['z_p_seg_map'])
-        recon_app_b = torch.sigmoid(recon_app_b_logits)
+        # 2. 获取 A 的几何 (Normal) -> 来自 z_s^A
+        Normal_A = model.normal_head(out_a['z_s_map'])
 
-    # --- 2. 数据转 Numpy ---
+        # 3. 获取 B 的光照 (Light) -> 来自 h^B
+        # 这里的 h_b 取自最后一层特征的均值
+        h_b = model.encoder(rgb_b)[-1].mean(dim=[2, 3])
+        Light_B = model.light_head(h_b)
+
+        # 4. 计算新的 Shading (A的形状 + B的光)
+        Shading_A_with_Light_B = shading_from_normals(Normal_A, Light_B)
+
+        # 5. 上采样对齐
+        target_size = (rgb_a.shape[2], rgb_a.shape[3])
+
+        # 对所有需要可视化的图进行 Resize
+        if Albedo_B.shape[-2:] != target_size:
+            Albedo_B = F.interpolate(Albedo_B, size=target_size, mode='bilinear', align_corners=False)
+            Albedo_A = F.interpolate(Albedo_A, size=target_size, mode='bilinear', align_corners=False)  # 【新增】
+            Shading_A_with_Light_B = F.interpolate(Shading_A_with_Light_B, size=target_size, mode='bilinear',
+                                                   align_corners=False)
+
+        # 6. 合成最终图像 (I = A * S)
+        I_swap = torch.clamp(Albedo_B * Shading_A_with_Light_B, 0.0, 1.0)
+
+    # --- 2. 转 Numpy 用于绘图 ---
     input_rgb_a = denormalize_image(batch_a['rgb'][0])
     input_rgb_b = denormalize_image(batch_b['rgb'][0])
 
-    geom_a = recon_geom_a.squeeze().cpu().numpy()
-    app_a = recon_app_a.squeeze().permute(1, 2, 0).cpu().numpy()
-    app_b = recon_app_b.squeeze().permute(1, 2, 0).cpu().numpy()
+    # 结果转 numpy
+    swap_result = I_swap[0].detach().cpu().permute(1, 2, 0).numpy()
+
+    # 中间变量
+    albedo_b_vis = Albedo_B[0].detach().cpu().permute(1, 2, 0).numpy()
+    albedo_a_vis = Albedo_A[0].detach().cpu().permute(1, 2, 0).numpy()  # 【新增】
+
+    # 【修复】Shading 可能 > 1.0，导致 matplotlib warning，这里手动 clip
+    shading_mix_vis = Shading_A_with_Light_B[0].detach().cpu().permute(1, 2, 0).numpy()
+    shading_mix_vis = np.clip(shading_mix_vis, 0.0, 1.0)
 
     # 获取场景名
     def get_scene_name(batch):
@@ -121,40 +154,43 @@ def _visualize_mixer(model, batch_a, batch_b, device, save_path, scene_class_map
     name_a = get_scene_name(batch_a)
     name_b = get_scene_name(batch_b)
 
-    # --- 3. 绘图 ---
+    # --- 3. 绘图 (恢复 6 张图) ---
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
-    fig.suptitle("Causal Disentanglement Analysis (Swap Test)", fontsize=22)
+    fig.suptitle("True Causal Swap (Intrinsic Decomposition)", fontsize=22)
 
-    # Row 1: A 的分解
+    # Row 1: Source A 相关
+    # (0,0) 输入 A
     axes[0, 0].imshow(input_rgb_a)
-    axes[0, 0].set_title(f"Input Image A\n({name_a})", fontsize=14)
+    axes[0, 0].set_title(f"Content Source A\n({name_a})", fontsize=14)
 
-    axes[0, 1].imshow(geom_a, cmap='plasma')
-    axes[0, 1].set_title("Structure ($z_s^A$)\nShould contain Shape/Edges", fontsize=14)
+    # (0,1) 结构 A + 光照 B (Shading)
+    axes[0, 1].imshow(shading_mix_vis, cmap='gray')  # Shading 通常用灰度展示更好，或者保持默认
+    axes[0, 1].set_title("Structure A + Light B\n(Shading from $z_s^A, L^B$)", fontsize=14)
 
-    axes[0, 2].imshow(app_a)
-    axes[0, 2].set_title("Appearance ($z_p^A$)\nShould contain Texture/Color", fontsize=14)
+    # (0,2) 【恢复位置】 A 的材质 (Albedo A)
+    axes[0, 2].imshow(albedo_a_vis)
+    axes[0, 2].set_title("Albedo A ($z_p^A$)\n(Intrinsic Texture of A)", fontsize=14)
 
-    # Row 2: B 的外观 + 混合
+    # Row 2: Source B 相关 + 结果
+    # (1,0) 输入 B
     axes[1, 0].imshow(input_rgb_b)
-    axes[1, 0].set_title(f"Input Image B\n({name_b})", fontsize=14)
+    axes[1, 0].set_title(f"Style Source B\n({name_b})", fontsize=14)
 
-    axes[1, 1].imshow(app_b)
-    axes[1, 1].set_title("Appearance ($z_p^B$)\nSource of Style", fontsize=14)
+    # (1,1) B 的材质 (Albedo B)
+    axes[1, 1].imshow(albedo_b_vis)
+    axes[1, 1].set_title("Albedo B ($z_p^B$)\n(Texture Source)", fontsize=14)
 
-    # Overlay: A的结构 + B的外观
-    # 简单的叠加可视化
-    geom_a_norm = (geom_a - geom_a.min()) / (geom_a.max() - geom_a.min() + 1e-6)
-    geom_a_rgb = np.stack([geom_a_norm] * 3, axis=-1)
-    overlay = 0.6 * geom_a_rgb + 0.4 * app_b
-    axes[1, 2].imshow(np.clip(overlay, 0, 1))
-    axes[1, 2].set_title("Overlay: Struct A + App B\n(Check alignment)", fontsize=14)
+    # (1,2) 结果 (Swap)
+    axes[1, 2].imshow(swap_result)
+    axes[1, 2].set_title("Result: Albedo B $\\times$ Shading A\n(True Generative Swap)", fontsize=16, color='red')
 
-    for ax in axes.flat: ax.axis('off')
+    for ax in axes.flat:
+        ax.axis('off')  # 统一关闭坐标轴
+
     plt.tight_layout(rect=[0, 0.03, 1, 0.93])
     plt.savefig(save_path, bbox_inches='tight', dpi=150)
     plt.close(fig)
-
+    print(f"  -> Saved Mixer: {save_path}")
 
 def _visualize_depth_task(model, batch, device, save_path):
     """
