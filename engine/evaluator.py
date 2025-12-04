@@ -30,7 +30,7 @@ def evaluate(model, val_loader, criterion, device, stage):
     else:
         scene_acc_metric = None  # 标记为 None
     depth_mse_metric = torchmetrics.regression.MeanSquaredError().to(device)
-    depth_abs_rel_metric = MeanAbsolutePercentageError().to(device)  # -> Abs Rel (等价于 MAPE)
+    depth_abs_rel_metric = torchmetrics.regression.MeanAbsolutePercentageError().to(device)  # -> Abs Rel (等价于 MAPE)
     depth_mae_metric = torchmetrics.regression.MeanAbsoluteError().to(device)
 
     # --- 2. 跟踪损失 ---
