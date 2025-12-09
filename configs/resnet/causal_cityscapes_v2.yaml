@@ -1,0 +1,74 @@
+# configs/resnet/causal_cityscapes_v12_depth_sniper.yaml
+# V12 策略：几乎关闭重构，全力狙击 Depth Abs Err
+
+data:
+  type: "cityscapes"
+  dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+  batch_size: 16
+  num_workers: 8
+  img_size: [128, 256]
+  pin_memory: True
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+  latent_dim_s: 128
+  latent_dim_p: 256
+  z_s_bottleneck_noise: 0.1
+  num_scene_classes: 1
+  num_seg_classes: 19
+  gating_scale_cap: 0.3
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+training:
+  seed: 999
+  epochs: 100
+  optimizer: "Adam"
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  enable_training: True
+
+  # 快速进入联合训练，靠 Loss 权重来平衡
+  stage1_epochs: 20
+  ind_warmup_epochs: 20
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+losses:
+  # 1. 任务损失 (不对称打击)
+  lambda_seg: 10.0        # 保持
+  lambda_depth: 20.0      # [MAX] 相比 Seg 加倍，死磕 Abs Err
+  lambda_normal: 0.0
+  lambda_scene: 0.0
+
+  # 2. 因果约束
+  lambda_independence: 0.05 # 弱约束
+
+  # 3. 重构损失 (极低)
+  alpha_recon_geom: 1.0
+  beta_recon_app: 1.0
+  lambda_l1_recon: 1.0
+
+  # 4. 辅助
+  alpha_recon_geom_aux: 0.2
+  beta_recon_app_aux: 0.2
+  lambda_depth_zp: 0.2
+
+  # 5. 分解正则
+  # [MINIMAL] 降至 0.1。彻底禁止模型靠“画图”来骗 Loss。
+  lambda_img: 0.1
+  lambda_alb_tv: 0.001
+  lambda_alb_chroma: 0.001
+  lambda_sh_gray: 0.01
+  lambda_norm: 0.01
+  lambda_xcov: 0.01

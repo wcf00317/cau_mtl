@@ -1,0 +1,74 @@
+# configs/resnet/causal_cityscapes_v11_stable.yaml
+# V11 策略：延长预热 + 降低重构权重，防止后期崩盘
+
+data:
+  type: "cityscapes"
+  dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+  batch_size: 16
+  num_workers: 8
+  img_size: [128, 256]
+  pin_memory: True
+
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+  latent_dim_s: 128
+  latent_dim_p: 256
+  z_s_bottleneck_noise: 0.1
+  num_scene_classes: 1
+  num_seg_classes: 19
+  gating_scale_cap: 0.3
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+training:
+  seed: 2024
+  epochs: 100
+  optimizer: "Adam"
+  learning_rate: 0.0001
+  weight_decay: 0.00001
+  enable_training: True
+
+  # [MODIFIED] 延长预热到 30%，给结构特征更多成型时间
+  stage1_epochs: 30
+  ind_warmup_epochs: 30
+
+  lr_scheduler:
+    type: "cosine"
+    warmup_epochs: 5
+    min_lr_factor: 0.01
+
+losses:
+  # 1. 任务损失
+  lambda_seg: 10.0        # 保持
+  lambda_depth: 5.0       # [BOOST] 从 1.0 提至 5.0，弥补 Abs Err
+  lambda_normal: 0.0
+  lambda_scene: 0.0
+
+  # 2. 因果约束
+  lambda_independence: 0.1 # 适度加强
+
+  # 3. 重构损失 (保持辅助定位)
+  alpha_recon_geom: 2.0
+  beta_recon_app: 2.0
+  lambda_l1_recon: 1.0
+
+  # 4. 辅助/边缘
+  alpha_recon_geom_aux: 0.5
+  beta_recon_app_aux: 0.5
+  lambda_depth_zp: 0.5
+
+  # 5. 分解正则
+  # [CRITICAL] 从 3.0 降至 1.0。只保留基本的画图能力，不让它抢梯度。
+  lambda_img: 1.0
+  lambda_alb_tv: 0.01
+  lambda_alb_chroma: 0.01
+  lambda_sh_gray: 0.1
+  lambda_norm: 0.1
+  lambda_xcov: 0.05
