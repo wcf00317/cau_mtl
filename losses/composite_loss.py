@@ -6,6 +6,32 @@ from .linear_cka import LinearCKA
 import torch.nn.functional as F
 from metrics.lpips import LPIPSMetric
 
+
+class ScaleInvariantLoss(nn.Module):
+    def __init__(self, lambda_var=0.5):
+        super().__init__()
+        self.lambda_var = lambda_var
+
+    def forward(self, pred, target):
+        # 1. 过滤无效真值 (target <= 0 的区域不计算)
+        valid_mask = target > 0
+        pred = pred[valid_mask]
+        target = target[valid_mask]
+
+        # [CRITICAL FIX] 2. 强制截断预测值，防止 <= 0 导致 log 报错
+        # 深度预测必须是正数，这里限制最小值为 0.001 (1毫米)
+        pred = torch.clamp(pred, min=1e-3)
+
+        # 3. 转换到 Log 空间 (不再需要 +1e-6，因为已经 clamp 过了)
+        d = torch.log(pred) - torch.log(target)
+
+        # 4. Loss 计算
+        term1 = torch.mean(d ** 2)
+        term2 = (torch.mean(d)) ** 2
+
+        loss = term1 - self.lambda_var * term2
+        return loss
+
 def edge_weight_from_gt(gt, alpha=2.0, q=0.7):
     """计算边界权重 w in [1, 1+alpha]"""
     if gt.dim()==3: gt=gt.unsqueeze(1)
@@ -77,8 +103,10 @@ def seg_edge_consistency_loss(seg_logits, geom_from_zs, weight=0.1, tau=0.1):
     gx_g, gy_g = _norm(gx_g), _norm(gy_g)
 
     edge_mag = (gx_g.abs() + gy_g.abs())
+    edge_mag_flat = edge_mag.view(edge_mag.size(0), -1).float()
+    q = torch.quantile(edge_mag_flat, 0.70, dim=1, keepdim=True)
     # 每张图动态取高梯度分位（比如 top 30%）
-    q = torch.quantile(edge_mag.view(edge_mag.size(0), -1), 0.70, dim=1, keepdim=True)  # 0.6~0.8 可调
+    #q = torch.quantile(edge_mag.view(edge_mag.size(0), -1), 0.70, dim=1, keepdim=True)  # 0.6~0.8 可调
     q = q.view(-1, 1, 1, 1)
     mask = (edge_mag > q).float()
 
@@ -186,13 +214,17 @@ class AdaptiveCompositeLoss(nn.Module):
     该改动不改变 d/d(log_var) 的梯度（仍为 0.5），
     因而不影响优化动态，但能避免“总损为负”的日志现象。
     """
-    def __init__(self, loss_weights):
+    def __init__(self, loss_weights,dataset):
         super().__init__()
-        self.weights = loss_weights
+        self.weights = loss_weights.copy()
 
         # ==== 基础项 ====
         self.seg_loss = nn.CrossEntropyLoss(ignore_index=-1)
-        self.depth_loss = nn.L1Loss()
+        if dataset == "nyuv2":
+            self.depth_loss = nn.L1Loss()
+            #self.depth_loss = ScaleInvariantLoss(lambda_var=0.5)
+        elif dataset == "cityscapes" or "gta5_to_cityscapes":
+            self.depth_loss = nn.L1Loss()
         self.scene_loss = nn.CrossEntropyLoss()
         self.normal_loss = NormalLoss()  # [NEW] 新增法线损失函数
 
@@ -248,30 +280,61 @@ class AdaptiveCompositeLoss(nn.Module):
 
     def forward(self, outputs, targets):
         loss_dict = {}
-
         # ===== 1) 主任务 =====
-        l_seg = self.seg_loss(outputs['pred_seg'], targets['segmentation'])
-        loss_seg = self._uw('seg', l_seg)
+        stage = int(outputs.get('stage'))
+        _dev = outputs['pred_seg'].device
+        if stage == 0:
 
-        # Depth
-        l_depth = self.depth_loss(outputs['pred_depth'], targets['depth'])
-        loss_depth = self._uw('depth', l_depth)
+            l_seg = torch.tensor(0.0, device=_dev)
+            l_depth = torch.tensor(0.0, device=_dev)
+            l_scene = torch.tensor(0.0, device=_dev)
+            l_normal = torch.tensor(0.0, device=_dev)
 
-        # Scene (Optional: 只有当权重 > 0 时才计算，兼容 NYUv2 无场景标签)
-        if self.weights.get('lambda_scene', 0.0) > 0:
-            l_scene = self.scene_loss(outputs['pred_scene'], targets['scene_type'])
-            loss_scene = self._uw('scene', l_scene)
+            # 加权 Loss 也直接设为 0，不经过 _uw (避免更新不确定性参数)
+            loss_seg = l_seg
+            loss_depth = l_depth
+            loss_scene = l_scene
+            loss_normal = l_normal
         else:
-            l_scene = torch.tensor(0.0, device=l_seg.device)
-            loss_scene = torch.tensor(0.0, device=l_seg.device)
+            l_seg = self.seg_loss(outputs['pred_seg'], targets['segmentation'])
+            loss_seg = self._uw('seg', l_seg)
+            # Depth
+            if self.weights.get('lambda_depth', 0.0) > 0:
+                # [MODIFIED] 手动实现带 Mask 的 L1 Loss (对齐 LibMTL)
+                # LibMTL 逻辑: 只计算 GT != 0 的区域
+                pred_d = outputs['pred_depth']
+                gt_d = targets['depth']
 
-        # Normal [NEW] (只有当输出和目标都存在时计算)
-        if 'normals' in outputs and 'normal' in targets and self.weights.get('lambda_normal', 0.0) > 0:
-            l_normal = self.normal_loss(outputs['normals'], targets['normal'])
-            loss_normal = self._uw('normal', l_normal)
-        else:
-            l_normal = torch.tensor(0.0, device=l_seg.device)
-            loss_normal = torch.tensor(0.0, device=l_seg.device)
+                mask = (gt_d != 0).float().detach()
+                num_valid = mask.sum()
+
+                if num_valid > 0:
+                    # 只在有效区域计算 L1
+                    # 你的 outputs['pred_depth'] 可能没有 sigmoid 约束(如果你没开)，
+                    # 但 GT 是归一化的。这里直接算 L1。
+                    diff = torch.abs(pred_d - gt_d) * mask
+                    l_depth = diff.sum() / num_valid
+                else:
+                    l_depth = torch.tensor(0.0, device=pred_d.device)
+                #l_depth = self.depth_loss(outputs['pred_depth'], targets['depth'])
+                loss_depth = self._uw('depth', l_depth)
+            else:
+                l_depth = torch.tensor(0.0, device=l_seg.device)
+                loss_depth = torch.tensor(0.0, device=l_seg.device)
+            # Scene (Optional: 只有当权重 > 0 时才计算，兼容 NYUv2 无场景标签)
+            if self.weights.get('lambda_scene', 0.0) > 0:
+                l_scene = self.scene_loss(outputs['pred_scene'], targets['scene_type'])
+                loss_scene = self._uw('scene', l_scene)
+            else:
+                l_scene = torch.tensor(0.0, device=l_seg.device)
+                loss_scene = torch.tensor(0.0, device=l_seg.device)
+            # Normal [NEW] (只有当输出和目标都存在时计算)
+            if 'normals' in outputs and 'normal' in targets and self.weights.get('lambda_normal', 0.0) > 0:
+                l_normal = self.normal_loss(outputs['normals'], targets['normal'])
+                loss_normal = self._uw('normal', l_normal)
+            else:
+                l_normal = torch.tensor(0.0, device=l_seg.device)
+                loss_normal = torch.tensor(0.0, device=l_seg.device)
 
         # 汇总任务 Loss
         l_task = loss_seg + loss_depth + loss_scene + loss_normal
@@ -291,10 +354,13 @@ class AdaptiveCompositeLoss(nn.Module):
         #z_p_scene = outputs['z_p_scene']
 
         z_s_centered = z_s - z_s.mean(dim=0, keepdim=True)
-
+        #.detach()
         cka_seg = self.independence_loss(z_s_centered, z_p_seg - z_p_seg.mean(0, keepdim=True))
-        cka_depth = self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True))
-        if 'z_p_normal' in outputs:
+        if self.weights.get('lambda_depth', 0.0) > 0:
+            cka_depth = self.independence_loss(z_s_centered, z_p_depth - z_p_depth.mean(0, keepdim=True))
+        else:
+            cka_depth = torch.tensor(0.0, device=z_s.device)
+        if 'z_p_normal' in outputs and self.weights.get('lambda_normal', 0.0) > 0:
             z_p_normal = outputs['z_p_normal']
             cka_normal = self.independence_loss(z_s_centered, z_p_normal - z_p_normal.mean(0, keepdim=True))
         else:
@@ -306,8 +372,7 @@ class AdaptiveCompositeLoss(nn.Module):
         loss_dict['cka_normal'] = cka_normal
         loss_dict['independence_loss'] = l_ind
 
-        stage = int(outputs.get('stage', 2))
-        if stage == 1:
+        if stage <= 1:
             loss_ind = torch.zeros_like(l_ind)
         else:
             loss_ind = self.weights.get('lambda_independence', 0.05) * l_ind
@@ -315,12 +380,16 @@ class AdaptiveCompositeLoss(nn.Module):
 
 
         # ===== 3) 重建（主） =====
-        l_recon_g = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
+        if self.weights.get('alpha_recon_geom', 0.0) > 0:
+            l_recon_g = self.recon_geom_loss(outputs['recon_geom'], targets['depth'])
+            loss_recon_g = self._uw('recon_geom', l_recon_g)
+        else:
+            l_recon_g = torch.tensor(0.0, device=z_s.device)
+            loss_recon_g = torch.tensor(0.0, device=z_s.device)
         l_recon_a_lpips = self.recon_app_loss_lpips(outputs['recon_app'], targets['appearance_target'])
         l_recon_a_l1 = self.recon_app_loss_l1(outputs['recon_app'], targets['appearance_target'])
         l_recon_a = l_recon_a_lpips + self.weights.get('lambda_l1_recon', 1.0) * l_recon_a_l1
 
-        loss_recon_g = self._uw('recon_geom', l_recon_g)
         loss_recon_a = self._uw('recon_app', l_recon_a)
 
         loss_dict.update({
@@ -328,7 +397,7 @@ class AdaptiveCompositeLoss(nn.Module):
             'recon_app_loss': l_recon_a,
         })
 
-        _dev = outputs['pred_depth'].device if 'pred_depth' in outputs else next(
+        _dev = outputs['pred_seg'].device if 'pred_depth' in outputs else next(
             v.device for v in outputs.values() if torch.is_tensor(v))
 
         # ===== 3.1) 分解式重构（可选） =====
@@ -391,15 +460,27 @@ class AdaptiveCompositeLoss(nn.Module):
 
         # ===== 5) 一致性项 =====
         # 5.1 原有：几何辅助头 vs GT
-        l_depth_from_zp = self.depth_loss(outputs['pred_depth_from_zp'], targets['depth'])
-        l_edge_geom = self.edge_consistency_loss(outputs['recon_geom'], targets['depth'])
+        if self.weights.get('lambda_depth_zp', 0.0) > 0:
+            l_depth_from_zp = self.depth_loss(outputs['pred_depth_from_zp'], targets['depth'])
+        else:
+            l_depth_from_zp = torch.tensor(0.0, device=_dev)
+
+            # 几何边缘一致性 (recon_geom vs GT)
+            # 依赖权重 lambda_edge_consistency
+        if self.weights.get('lambda_edge_consistency', 0.0) > 0:
+            l_edge_geom = self.edge_consistency_loss(outputs['recon_geom'], targets['depth'])
+        else:
+            l_edge_geom = torch.tensor(0.0, device=_dev)
         edge_w = self.weights.get('alpha_recon_geom_edges', 0.1)
         seg_edge_w = self.weights.get('beta_seg_edge_from_geom', 0.1)
 
         # 5.2 新增：主头 pred_depth vs GT 的边缘一致性（关键改动）
-        l_edge_pred = self.edge_consistency_loss(outputs['pred_depth'], targets['depth'])
         edge_pred_w = self.weights.get('lambda_edge_consistency_pred',
                                        self.weights.get('lambda_edge_consistency', 0.0))
+        if edge_pred_w > 0:
+            l_edge_pred = self.edge_consistency_loss(outputs['pred_depth'], targets['depth'])
+        else:
+            l_edge_pred = torch.tensor(0.0, device=_dev)
 
         loss_dict.update({
             'depth_from_zp_loss': l_depth_from_zp,

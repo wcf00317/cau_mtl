@@ -7,40 +7,38 @@ from torchvision import transforms
 from PIL import Image
 import random
 
-# GTA5 (34 classes) -> Cityscapes (19 classes) 映射表
+# GTA5 (34 classes) -> Cityscapes (7 classes) 映射表
 # 格式: GTA5_ID: Cityscapes_TrainID
 # 255 表示忽略
-GTA5_TO_CITYSCAPES_MAPPING = {
-    0: 255, 1: 255, 2: 255, 3: 255, 4: 255, 5: 255, 6: 255,
-    7: 0,  # Road
-    8: 1,  # Sidewalk
-    9: 255, 10: 255,
-    11: 2,  # Building
-    12: 3,  # Wall
-    13: 4,  # Fence
-    14: 255, 15: 255, 16: 255,
-    17: 5,  # Pole
-    18: 255,
-    19: 6,  # Traffic light
-    20: 7,  # Traffic sign
-    21: 8,  # Vegetation
-    22: 9,  # Terrain
-    23: 10,  # Sky
-    24: 11,  # Person
-    25: 12,  # Rider
-    26: 13,  # Car
-    27: 14,  # Truck
-    28: 15,  # Bus
-    29: 255, 30: 255,
-    31: 16,  # Train
-    32: 17,  # Motorcycle
-    33: 18,  # Bicycle
-    -1: 255
+GTA5_TO_7_CLASSES = {
+    0: -1, 1: -1, 2: -1, 3: -1, 4: -1, 5: -1, 6: -1,
+    7: 0,   # Road
+    8: 0,   # Sidewalk
+    9: -1, 10: -1,
+    11: 1,  # Building
+    12: 1,  # Wall
+    13: 1,  # Fence
+    14: -1, 15: -1, 16: -1,
+    17: 2,  # Pole
+    18: -1,
+    19: 2,  # Traffic light
+    20: 2,  # Traffic sign
+    21: 3,  # Vegetation
+    22: 3,  # Terrain
+    23: 4,  # Sky
+    24: 5,  # Person
+    25: 5,  # Rider
+    26: 6,  # Car
+    27: 6,  # Truck
+    28: 6,  # Bus
+    29: -1, 30: -1,
+    31: 6,  # Train
+    32: 6,  # Motorcycle
+    33: 6,  # Bicycle
 }
 
-
 class GTA5Dataset(Dataset):
-    def __init__(self, root_dir, img_size=(384, 384)):
+    def __init__(self, root_dir, img_size):
         """
         Args:
             root_dir: GTA5 数据集根目录 (e.g., '../mtl_dataset/gta5')
@@ -80,8 +78,8 @@ class GTA5Dataset(Dataset):
         self.targets.sort()
 
         # 预计算映射数组
-        self.mapping = np.zeros(256, dtype=np.int64) + 255
-        for k, v in GTA5_TO_CITYSCAPES_MAPPING.items():
+        self.mapping = np.zeros(256, dtype=np.int64) - 1
+        for k, v in GTA5_TO_7_CLASSES.items():
             if k >= 0:
                 self.mapping[k] = v
 
@@ -98,9 +96,8 @@ class GTA5Dataset(Dataset):
         label = Image.open(label_path)
 
         # Resize (Nearest for label)
-        img = img.resize(self.img_size, Image.BILINEAR)
-        label = label.resize(self.img_size, Image.NEAREST)
-
+        img = img.resize((self.img_size[1], self.img_size[0]), Image.BILINEAR)
+        label = label.resize((self.img_size[1], self.img_size[0]), Image.NEAREST)
         # 随机水平翻转 (Sim-to-Real 训练时增强很重要)
         if random.random() < 0.5:
             img = transforms.functional.hflip(img)
@@ -110,8 +107,6 @@ class GTA5Dataset(Dataset):
         to_tensor = transforms.ToTensor()
         rgb_tensor_unnormalized = to_tensor(img).float()
 
-        normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        rgb_tensor_normalized = normalize(rgb_tensor_unnormalized)
 
         # Label Mapping
         label_np = np.array(label, dtype=np.int64)
@@ -125,7 +120,7 @@ class GTA5Dataset(Dataset):
         depth_tensor = torch.zeros((1, self.img_size[1], self.img_size[0]), dtype=torch.float32)
 
         return {
-            'rgb': rgb_tensor_normalized,
+            'rgb': rgb_tensor_unnormalized,
             'depth': depth_tensor,  # 占位
             'segmentation': seg_tensor,
             'scene_type': torch.tensor(0),  # 占位

@@ -1,4 +1,4 @@
-import yaml
+import yaml,json
 import torch
 import torch.optim as optim
 from torch.utils.data import DataLoader
@@ -47,6 +47,11 @@ def main(config_path):
     setup_logging(run_dir)
     logging.info("✅ Configuration loaded successfully.")
     logging.info(f"📂 All outputs for this run will be saved in: {run_dir}")
+    logging.info("=" * 60)
+    logging.info("🔧 Final Execution Configuration:")
+    # 使用 json.dumps 格式化打印，default=str 防止某些对象无法序列化
+    logging.info(json.dumps(config, indent=4, default=str))
+    logging.info("=" * 60)
 
     # 2. 设置计算设备
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -63,28 +68,47 @@ def main(config_path):
         logging.info(f"📋 Dataset Type: {dataset_type}")
         logging.info(f"📂 Dataset Path: {dataset_path}")
 
+        val_loader_source = None
+
         # === 数据集加载逻辑 ===
         if dataset_type == 'gta5_to_cityscapes':
             # ... (Sim-to-Real 逻辑保持不变，如果需要) ...
             train_path = data_cfg['train_dataset_path']
             val_path = data_cfg['val_dataset_path']
             train_dataset = GTA5Dataset(root_dir=train_path, img_size=img_size)
-            val_dataset = CityscapesDataset(root_dir=val_path, split='val', img_size=img_size)
+            val_dataset = CityscapesDataset(root_dir=val_path, split='val')
+
+            source_val_path = data_cfg.get('source_val_path')
+
+            logging.info(f"   -> Train (Source): {train_path}")
+            logging.info(f"   -> Val (Source):   {source_val_path}")
+            logging.info(f"   -> Val (Target):   {val_path}")
+
+            if source_val_path:
+                source_val_dataset = GTA5Dataset(root_dir=source_val_path, img_size=img_size)
+                # 创建 Source DataLoader
+                val_loader_source = DataLoader(
+                    source_val_dataset,
+                    batch_size=data_cfg['batch_size'],
+                    shuffle=False,
+                    num_workers=data_cfg['num_workers'],
+                    pin_memory=data_cfg.get('pin_memory', True)
+                )
             # 兼容性引用
             full_dataset = train_dataset
 
         elif dataset_type == 'cityscapes':
             logging.info("🌍 Mode: Cityscapes (LibMTL format)")
-            train_dataset = CityscapesDataset(root_dir=dataset_path, split='train', img_size=img_size)
-            val_dataset = CityscapesDataset(root_dir=dataset_path, split='val', img_size=img_size)
+            train_dataset = CityscapesDataset(root_dir=dataset_path, split='train')
+            val_dataset = CityscapesDataset(root_dir=dataset_path, split='val')
             full_dataset = train_dataset
 
         elif dataset_type == 'nyuv2':
             logging.info("🏠 Mode: NYUv2 (LibMTL format - Folder based)")
             # [MODIFIED] 不再读取 HDF5，而是直接实例化 Train/Val Dataset
             # LibMTL 格式中，train 和 val 是分开的文件夹，通过 mode 参数控制
-            train_dataset = NYUv2Dataset(root_dir=dataset_path, mode='train', img_size=img_size)
-            val_dataset = NYUv2Dataset(root_dir=dataset_path, mode='val', img_size=img_size)
+            train_dataset = NYUv2Dataset(root_dir=dataset_path, mode='train',augmentation = data_cfg.get('augmentation', False))
+            val_dataset = NYUv2Dataset(root_dir=dataset_path, mode='val')
             full_dataset = train_dataset  # 仅用于获取属性，不影响逻辑
 
         else:
@@ -155,10 +179,10 @@ def main(config_path):
         # LibMTL 默认配置: Adam, lr=1e-4, weight_decay=1e-5
         optimizer = optim.Adam([
             {'params': backbone_params, 'lr': base_lr},  # Backbone LR
-            {'params': head_params, 'lr': base_lr * 10}  # Head LR 通常大一些 (可选，或者保持一致)
+            {'params': head_params, 'lr': base_lr }  # Head LR 通常大一些 (可选，或者保持一致)
         ], lr=base_lr, weight_decay=config['training']['weight_decay'])
 
-        criterion = AdaptiveCompositeLoss(config['losses']).to(device)
+        criterion = AdaptiveCompositeLoss(config['losses'], dataset_type).to(device)
 
     logging.info(f"🔧 Optimizer: {config['training']['optimizer']}, LR: {base_lr}")
 
@@ -170,7 +194,8 @@ def main(config_path):
     # 6. 启动训练
     logging.info("\n----- Starting Training -----")
     if config['training'].get('enable_training', True):
-        train(model, train_loader, val_loader, optimizer, criterion, scheduler, config, device, checkpoint_dir)
+        train(model, train_loader, val_loader, optimizer, criterion, scheduler, config,
+              device, checkpoint_dir,val_loader_source=val_loader_source)
     else:
         logging.info("🏃 Training is disabled in config.")
 
@@ -187,7 +212,7 @@ def main(config_path):
     if os.path.exists(best_ckpt):
         checkpoint = torch.load(best_ckpt, map_location=device)
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        generate_visual_reports(model, val_loader, device, save_dir=vis_dir, num_reports=5)
+        generate_visual_reports(model, val_loader, device, save_dir=vis_dir, num_reports=3)
 
     if hasattr(train_dataset, "close"): train_dataset.close()
     if hasattr(val_dataset, "close"): val_dataset.close()
@@ -197,6 +222,6 @@ def main(config_path):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--config', type=str, default='configs/resnet50_nyuv2.yaml')
+    parser.add_argument('--config', type=str)
     args = parser.parse_args()
     main(args.config)

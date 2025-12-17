@@ -1,27 +1,19 @@
-# configs/resnet/causal_nyuv2_v5_depth_sota.yaml
-# V5 策略：在保持 Seg/Normal SOTA 的基础上，全力修复 Depth 短板
-
-# -- Data --
 data:
   type: "nyuv2"
   dataset_path: "/data/chengfengwu/alrl/mtl_dataset/nyuv2"
-  batch_size: 8
+  batch_size: 32   # 如果显存允许，尽量开大
   num_workers: 4
-  img_size: [384, 384]
-  pin_memory: True
+  img_size: [288, 384]
 
-# -- Model --
 model:
   type: "causal"
   encoder_name: "resnet50"
   pretrained: True
-  latent_dim_s: 128
-  latent_dim_p: 256
-  z_s_bottleneck_noise: 0.1
-  num_scene_classes: 1
-  num_seg_classes: 40
-  gating_scale_cap: 0.3
-
+  latent_dim_s: 1024
+  latent_dim_p: 64
+  z_s_bottleneck_noise: 0.1 # 稍微加点噪声防止过拟合
+  
+  # 关键：开启分解头，利用你的 decomposition loss 辅助 z_p 学习
   decomposition:
     enabled: true
     normal_head_hidden: 128
@@ -30,49 +22,45 @@ model:
       sh_degree: 2
       grayscale_prior: true
 
-# -- Training --
 training:
-  seed: 2025              # 新种子
-  epochs: 100             # 保持 200 以便充分收敛
-  optimizer: "Adam"
-  learning_rate: 0.0001
-  weight_decay: 0.00001
-  enable_training: True
-
-  stage1_epochs: 20
-  ind_warmup_epochs: 20
+  seed: 2024           # 固定种子
+  epochs: 100          # 冲击 SOTA 建议 200
+  optimizer: "AdamW"   # AdamW 比 Adam 泛化性更好
+  learning_rate: 0.0002
+  weight_decay: 0.0001   # 增加一点 decay 防止过拟合
+  
+  # === 时间表控制 ===
+  stage0_epochs: 5     # 仅训练分解 (A*S=I)
+  stage1_epochs: 35    # 强力预热 z_s (20% 时间)
+  ind_warmup_epochs: 35 # CKA 慢慢介入
 
   lr_scheduler:
     type: "cosine"
     warmup_epochs: 5
     min_lr_factor: 0.01
 
-# -- Losses (关键调整) --
 losses:
-  # 1. 任务损失 (非对称加权)
-  lambda_seg: 2.0         # [KEEP] 保持现状，稳住 mIoU
-  lambda_normal: 2.0      # [BOOST] 从 1.0 提至 2.0，巩固 Normal 优势
-  lambda_depth: 10.0      # [CRITICAL] 从 1.0 暴增至 10.0，强制模型关注 Depth L1 Loss
+  # === 核心任务 (高压策略) ===
+  lambda_seg: 10.0
+  lambda_depth: 20.0   # [重点] 压低 RMSE
+  lambda_normal: 10.0  # [重点] 优化角度误差
   lambda_scene: 0.0
+  lambda_depth_zp: 1.0
 
-  # 2. 因果约束
-  lambda_independence: 0.1 # [KEEP] V4 的设置证明有效
+  # === 解耦 ===
+  lambda_independence: 1.0 # [重点] 10.0比1.0效果好
 
-  # 3. 重构损失 (适度降权)
-  # [LOWER] 从 5.0 降至 2.0。V4 的 5.0 虽然让可视化清晰，但可能抢了深度的资源。
+  # === 重构 (辅助) ===
+  # 既然开启了 decomposition，可以适当降低纯像素重构的权重，依赖物理重构
   alpha_recon_geom: 2.0
   beta_recon_app: 2.0
   lambda_l1_recon: 1.0
 
-  # 4. 辅助
-  alpha_recon_geom_aux: 0.5
-  beta_recon_app_aux: 0.5
-  lambda_depth_zp: 0.5
+  # === 分解正则 (利用你代码里的 Albedo/Shading) ===
+  lambda_img: 2.0        # I_hat = A*S，这个权重要高，保证 z_p 学到真正的 Albedo
+  lambda_alb_tv: 0.1    # 平滑 Albedo
+  lambda_sh_gray: 0.1    # 白光假设
+  lambda_xcov: 0.5      # 抑制 Albedo 和 Normal 的相关性 (另一种解耦)
 
-  # 5. 分解正则
-  lambda_img: 2.0         # [LOWER] 从 5.0 降至 2.0，给深度任务腾出梯度空间
-  lambda_alb_tv: 0.01
-  lambda_alb_chroma: 0.01
-  lambda_sh_gray: 0.1
-  lambda_norm: 0.1
-  lambda_xcov: 0.05
+  # === 边缘一致性 ===
+  lambda_edge_consistency: 1.0 # 强化边缘

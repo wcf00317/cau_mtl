@@ -1,0 +1,100 @@
+# configs/gta5_to_cityscapes_stable.yaml
+
+# -- Data Parameters --
+data:
+  type: "gta5_to_cityscapes"
+  train_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/train"
+
+  # 目标域验证集 (Cityscapes Val) - 用于选最佳模型
+  val_dataset_path: "/data/chengfengwu/alrl/mtl_dataset/cityscape_preprocess"
+
+  # 源域验证集 (GTA5 Val)
+  source_val_path: "/data/chengfengwu/alrl/mtl_dataset/gta5/val"
+
+  batch_size: 8
+  num_workers: 4
+  img_size: [128, 256]
+  pin_memory: True
+
+# -- Model Parameters --
+model:
+  type: "causal"
+  encoder_name: "resnet50"
+  pretrained: True
+  latent_dim_s: 128
+  latent_dim_p: 256
+  z_s_bottleneck_noise: 0.1
+  num_scene_classes: 1
+  gating_scale_cap: 0.3
+  num_seg_classes: 7
+
+  decomposition:
+    enabled: true
+    normal_head_hidden: 128
+    albedo_head_hidden: 128
+    light_head:
+      sh_degree: 2
+      grayscale_prior: true
+
+# -- Training Parameters --
+training:
+  seed: 42
+  epochs: 100
+  optimizer: "AdamW"
+  learning_rate: 0.00005
+  weight_decay: 0.01
+  enable_training: True
+
+  # === [关键修改] 时间表控制 ===
+  stage0_epochs: 5      # 分解预热
+  stage1_epochs: 40     # [修改] 延长结构预热期 (原20 -> 40)，确保主任务绝对收敛
+  ind_warmup_epochs: 40 # [修改] 独立性约束缓慢介入 (线性增加)，避免 Stage 2 瞬间崩塌
+
+  lr_scheduler:
+    type: cosine
+    warmup_epochs: 3
+    min_lr_factor: 0.01 # [修改] 允许 LR 降得更低 (原0.1 -> 0.01)，后期微调更稳定
+
+# -- Loss Weights --
+losses:
+  # === 主任务 ===
+  lambda_seg: 10.0      # 保持高权重
+  lambda_depth: 0.0     # GTA5 无深度
+  lambda_scene: 0.0     # GTA5 无场景
+
+  # === [关键修改] 独立性约束 ===
+  # 虽然你提到10.0更好，但在Sim-to-Real这种脆弱场景下，建议先用 1.0 配合 Warmup
+  # 如果这次稳住了，下次可以尝试加到 2.0 或 5.0
+  lambda_independence: 1.0
+
+  # === [关键修改] 重构 (辅助) ===
+  alpha_recon_geom: 0.0      # 无深度真值
+
+  # [修改] 降低外观重构权重 (3.0 -> 1.0)
+  # 过高的外观重构会强迫模型记住 GTA5 的合成纹理，导致负迁移
+  beta_recon_app: 1.0
+  lambda_l1_recon: 1.0       # 配合降低
+
+  alpha_recon_geom_aux: 0.0
+  beta_recon_app_aux: 1.0    # 稍微降低辅助重构权重 (原 2.5)
+  lambda_depth_zp: 0.0
+
+  # === 边缘一致性 (全关) ===
+  lambda_depth_edge_weight_alpha: 0.0
+  lambda_depth_edge_weight_q: 0.0
+  lambda_depth_edge_weight_mix: 0.0
+  lambda_edge_consistency: 0.0
+  alpha_recon_geom_edges: 0.0
+  beta_seg_edge_from_geom: 0.0
+  lambda_main_depth_edge: 0.0
+
+  # === 分解式重构 ===
+  lambda_img: 1.0
+  lambda_alb_tv: 0.1
+  lambda_alb_chroma: 0.05
+  lambda_sh_gray: 0.1
+  lambda_norm: 0.1
+
+  # [修改] 提高交叉协方差约束 (0.05 -> 0.2)
+  # 参考你的 nyuv2 配置，这是另一种更温和的解耦手段
+  lambda_xcov: 0.2
